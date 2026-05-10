@@ -11,7 +11,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -26,6 +26,41 @@ user_processing: dict[int, bool] = {}
 
 
 MediaType = Literal["movie", "series"]
+
+
+async def safe_answer(target: Message, text: str, **kwargs) -> None:
+    for attempt in range(3):
+        try:
+            await target.answer(text, **kwargs)
+            return
+        except TelegramNetworkError as exc:
+            logging.warning("Telegram timeout sending message, attempt %s/3: %s", attempt + 1, exc)
+            await asyncio.sleep(1 + attempt)
+
+
+async def safe_send_message(bot: Bot, chat_id: int | str, text: str, **kwargs) -> None:
+    for attempt in range(3):
+        try:
+            await bot.send_message(chat_id, text, **kwargs)
+            return
+        except TelegramNetworkError as exc:
+            logging.warning("Telegram timeout sending direct message, attempt %s/3: %s", attempt + 1, exc)
+            await asyncio.sleep(1 + attempt)
+
+
+async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str) -> None:
+    for attempt in range(3):
+        try:
+            if data["kind"] == "video":
+                await bot.send_video(chat_id, data["file_id"], caption=caption)
+            else:
+                await bot.send_document(chat_id, data["file_id"], caption=caption)
+            return
+        except TelegramNetworkError as exc:
+            logging.warning("Telegram timeout sending media, attempt %s/3: %s", attempt + 1, exc)
+            await asyncio.sleep(2 + attempt)
+
+    raise TimeoutError("Telegram media send timeout after retries")
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4"}
 MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", re.IGNORECASE)
@@ -337,7 +372,7 @@ def is_allowed(config: Config, user_id: int | None) -> bool:
 async def reject_if_not_allowed(message: Message, config: Config) -> bool:
     if is_allowed(config, message.from_user.id if message.from_user else None):
         return False
-    await message.answer("No tienes permiso para usar este bot.")
+    await safe_answer(message, "No tienes permiso para usar este bot.")
     return True
 
 
@@ -345,7 +380,8 @@ async def start(message: Message, state: FSMContext, config: Config) -> None:
     if await reject_if_not_allowed(message, config):
         return
     await state.clear()
-    await message.answer(
+    await safe_answer(
+        message,
         "Envíame o reenvíame un video como archivo/documento o video. "
         "Puedes enviarme varios a la vez y los procesaré uno por uno en cola.\n"
         "No guardo archivos en disco; Telegram lo copia directo al canal."
@@ -356,7 +392,7 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     queue = user_queues.get(user_id, [])
     if not queue:
         user_processing[user_id] = False
-        await bot.send_message(user_id, "✅ Todos los videos en cola han sido procesados.")
+        await safe_send_message(bot, user_id, "✅ Todos los videos en cola han sido procesados.")
         return
 
     user_processing[user_id] = True
@@ -367,22 +403,22 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     
     video_info = get_video_info(message)
     if not video_info:
-        await message.answer("Archivo omitido: no es un video válido .mkv o .mp4.")
+        await safe_answer(message, "Archivo omitido: no es un video válido .mkv o .mp4.")
         await process_next_in_queue(user_id, state, bot, config)
         return
 
     if is_multipart(video_info["file_name"]):
-        await message.answer(f"Archivo <b>{video_info['file_name']}</b> multipart detectado y omitido automáticamente.")
+        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> multipart detectado y omitido automáticamente.")
         await process_next_in_queue(user_id, state, bot, config)
         return
 
     ext = get_extension(video_info["file_name"])
     if ext and ext not in VIDEO_EXTENSIONS:
-        await message.answer(f"Archivo <b>{video_info['file_name']}</b> omitido: La extensión debe ser .mkv o .mp4.")
+        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> omitido: La extensión debe ser .mkv o .mp4.")
         await process_next_in_queue(user_id, state, bot, config)
         return
 
-    await message.answer(f"⏳ Procesando: <b>{video_info['file_name']}</b>...")
+    await safe_answer(message, f"⏳ Procesando: <b>{video_info['file_name']}</b>...")
 
     quality = detected_quality(video_info)
     await state.update_data(**video_info, quality=quality)
@@ -406,23 +442,20 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 
                 if config.llm_auto_post:
                     try:
-                        if video_info["kind"] == "video":
-                            await bot.send_video(config.target_channel_id, video_info["file_id"], caption=caption)
-                        else:
-                            await bot.send_document(config.target_channel_id, video_info["file_id"], caption=caption)
+                        await safe_send_media(bot, config.target_channel_id, video_info, caption)
                         
-                        await message.answer(f"✅ Auto-publicado: <code>{caption}</code>")
+                        await safe_answer(message, f"✅ Auto-publicado: <code>{caption}</code>")
                         await state.clear()
                         await process_next_in_queue(user_id, state, bot, config)
                         return
-                    except (TelegramBadRequest, TelegramForbiddenError) as exc:
-                        await message.answer(f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
+                    except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
+                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
                         # Si falla el auto-post, cae al flujo manual normal
                 
                 await state.set_state(MediaForm.confirming_llm)
                 
                 text = f"🤖 <b>Detección inteligente (LLM)</b>\n\nHe generado el siguiente formato:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?"
-                await message.answer(text, reply_markup=llm_confirm_keyboard())
+                await safe_answer(message, text, reply_markup=llm_confirm_keyboard())
                 return
             except KeyError as e:
                 logging.error(f"LLM data missing key for build_caption: {e}")
@@ -443,12 +476,12 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 kind = "Serie" if media_type == "tv" else "Película"
                 
                 text = f"Encontré esto en TMDB:\n\n<b>{title}</b> ({year}) - {kind}\n\n¿Es correcto?"
-                await message.answer(text, reply_markup=tmdb_confirm_keyboard())
+                await safe_answer(message, text, reply_markup=tmdb_confirm_keyboard())
                 return
 
     await state.set_state(MediaForm.choosing_type)
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
-    await message.answer(f"¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+    await safe_answer(message, f"¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
 
 
 async def receive_video(message: Message, state: FSMContext, bot: Bot, config: Config) -> None:
@@ -463,7 +496,7 @@ async def receive_video(message: Message, state: FSMContext, bot: Bot, config: C
     
     queue_length = len(user_queues[user_id])
     if queue_length > 1:
-        await message.answer(f"📥 Video añadido a la cola (Posición: {queue_length}).")
+        await safe_answer(message, f"📥 Video añadido a la cola (Posición: {queue_length}).")
         
     if not user_processing.get(user_id, False):
         await process_next_in_queue(user_id, state, bot, config)
@@ -480,15 +513,12 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
         await callback.answer()
         data = await state.get_data()
         try:
-            if data["kind"] == "video":
-                await bot.send_video(config.target_channel_id, data["file_id"], caption=data["caption"])
-            else:
-                await bot.send_document(config.target_channel_id, data["file_id"], caption=data["caption"])
+            await safe_send_media(bot, config.target_channel_id, data, data["caption"])
             
             await state.clear()
-            await callback.message.answer("✅ Archivo enviado al canal correctamente.")
-        except (TelegramBadRequest, TelegramForbiddenError) as exc:
-            await callback.message.answer(f"Error enviando al canal: {exc}")
+            await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente.")
+        except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
+            await safe_answer(callback.message, f"Error enviando al canal: {exc}")
             
         await process_next_in_queue(callback.from_user.id, state, bot, config)
         return
@@ -500,7 +530,7 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
     
     await state.set_state(MediaForm.choosing_type)
-    await callback.message.answer(f"Modo manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+    await safe_answer(callback.message, f"Modo manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
 
 
 async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
@@ -518,7 +548,7 @@ async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config
 
     if action == "no":
         await state.set_state(MediaForm.choosing_type)
-        await callback.message.answer(f"Ok, continuemos manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+        await safe_answer(callback.message, f"Ok, continuemos manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
         return
 
     media_type = "series" if tmdb_data.get("media_type") == "tv" else "movie"
@@ -532,10 +562,10 @@ async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_quality)
-        await callback.message.answer(f"Película: {title} ({date[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
+        await safe_answer(callback.message, f"Película: {title} ({date[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
     else:
         await state.set_state(MediaForm.series_season)
-        await callback.message.answer(f"Serie: {title}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
+        await safe_answer(callback.message, f"Serie: {title}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
 
 
 async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
@@ -549,35 +579,35 @@ async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_name)
-        await callback.message.answer("Título de la película. Ejemplo: Ghosted")
+        await safe_answer(callback.message, "Título de la película. Ejemplo: Ghosted")
         return
 
     await state.set_state(MediaForm.series_name)
-    await callback.message.answer("Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
+    await safe_answer(callback.message, "Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
 
 
 async def movie_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=clean_text(message.text or ""))
     await state.set_state(MediaForm.movie_year)
-    await message.answer("Año de estreno. Ejemplo: 2023")
+    await safe_answer(message, "Año de estreno. Ejemplo: 2023")
 
 
 async def movie_year(message: Message, state: FSMContext) -> None:
     year = clean_text(message.text or "")
     if not re.fullmatch(r"\d{4}", year):
-        await message.answer("El año debe tener 4 números. Ejemplo: 2023")
+        await safe_answer(message, "El año debe tener 4 números. Ejemplo: 2023")
         return
     await state.update_data(year=year)
     data = await state.get_data()
     await state.set_state(MediaForm.movie_quality)
     detected = data.get("quality")
-    await message.answer(f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+    await safe_answer(message, f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
 
 
 async def movie_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.movie_optional)
-    await message.answer("Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay, escribe -")
+    await safe_answer(message, "Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay, escribe -")
 
 
 async def movie_optional(message: Message, state: FSMContext) -> None:
@@ -588,35 +618,35 @@ async def movie_optional(message: Message, state: FSMContext) -> None:
 async def series_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=clean_text(message.text or ""))
     await state.set_state(MediaForm.series_season)
-    await message.answer("Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
+    await safe_answer(message, "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
 
 
 async def series_season(message: Message, state: FSMContext) -> None:
     season = clean_text(message.text or "").upper()
     if not SEASON_RE.fullmatch(season):
-        await message.answer("Formato inválido. Usa S seguido de mínimo 2 números. Ejemplo: S01")
+        await safe_answer(message, "Formato inválido. Usa S seguido de mínimo 2 números. Ejemplo: S01")
         return
     await state.update_data(season=season)
     await state.set_state(MediaForm.series_episode)
-    await message.answer("Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
+    await safe_answer(message, "Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
 
 
 async def series_episode(message: Message, state: FSMContext) -> None:
     episode = clean_text(message.text or "").upper()
     if not EPISODE_RE.fullmatch(episode):
-        await message.answer("Formato inválido. Usa E seguido de mínimo 2 números. Ejemplo: E04")
+        await safe_answer(message, "Formato inválido. Usa E seguido de mínimo 2 números. Ejemplo: E04")
         return
     await state.update_data(episode=episode)
     data = await state.get_data()
     await state.set_state(MediaForm.series_quality)
     detected = data.get("quality")
-    await message.answer(f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+    await safe_answer(message, f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
 
 
 async def series_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.series_optional)
-    await message.answer("Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay, escribe -")
+    await safe_answer(message, "Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay, escribe -")
 
 
 async def series_optional(message: Message, state: FSMContext) -> None:
@@ -629,7 +659,7 @@ async def show_preview(message: Message, state: FSMContext) -> None:
     caption = build_caption(data)
     await state.update_data(caption=caption)
     await state.set_state(MediaForm.confirming)
-    await message.answer(f"Vista previa:\n<code>{caption}</code>", reply_markup=confirm_keyboard())
+    await safe_answer(message, f"Vista previa:\n<code>{caption}</code>", reply_markup=confirm_keyboard())
 
 
 async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: Config) -> None:
@@ -640,29 +670,26 @@ async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: 
     action = callback.data.split(":", 1)[1]
     if action == "cancel":
         await callback.answer("Cancelado")
-        await callback.message.answer("Operación cancelada para este archivo.")
+        await safe_answer(callback.message, "Operación cancelada para este archivo.")
         await process_next_in_queue(callback.from_user.id, state, bot, config)
         return
 
     data = await state.get_data()
     try:
-        if data["kind"] == "video":
-            await bot.send_video(config.target_channel_id, data["file_id"], caption=data["caption"])
-        else:
-            await bot.send_document(config.target_channel_id, data["file_id"], caption=data["caption"])
-    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        await safe_send_media(bot, config.target_channel_id, data, data["caption"])
+    except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
         await callback.answer("No se pudo enviar", show_alert=True)
-        await callback.message.answer(f"Error enviando al canal: {exc}")
+        await safe_answer(callback.message, f"Error enviando al canal: {exc}")
         await process_next_in_queue(callback.from_user.id, state, bot, config)
         return
 
     await callback.answer("Enviado")
-    await callback.message.answer("✅ Archivo enviado al canal.")
+    await safe_answer(callback.message, "✅ Archivo enviado al canal.")
     await process_next_in_queue(callback.from_user.id, state, bot, config)
 
 
 async def cancel(message: Message, state: FSMContext, bot: Bot, config: Config) -> None:
-    await message.answer("Operación cancelada para este archivo.")
+    await safe_answer(message, "Operación cancelada para este archivo.")
     await process_next_in_queue(message.from_user.id, state, bot, config)
 
 
