@@ -317,7 +317,49 @@ async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str
     raise TimeoutError("Telegram media send timeout after retries")
 
 
+async def safe_send_temp_media(bot: Bot, chat_id: int | str, data: dict, config: "Config") -> Message | None:
+    max_retries = config.telegram_max_retries
+    for attempt in range(max_retries):
+        try:
+            await telegram_rate_limit(config)
+            if data["kind"] == "video":
+                return await bot.send_video(chat_id, data["file_id"], caption="Archivo para revisar")
+            return await bot.send_document(chat_id, data["file_id"], caption="Archivo para revisar")
+        except TelegramRetryAfter as exc:
+            logging.warning("Telegram flood control sending temp media, retry after %s seconds", exc.retry_after)
+            await asyncio.sleep(exc.retry_after + 1)
+        except TelegramNetworkError as exc:
+            logging.warning("Telegram timeout sending temp media, attempt %s/%s: %s", attempt + 1, max_retries, exc)
+            await asyncio.sleep(min(60, 2 ** attempt))
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            logging.warning("Could not send temp media: %s", exc)
+            return None
+    logging.error("Failed to send temporary media after %s attempts", max_retries)
+    return None
+
+
+async def show_temp_review_media(message: Message, state: FSMContext, bot: Bot, config: "Config", data: dict) -> None:
+    existing = (await state.get_data()).get("temp_review_message_id")
+    if existing:
+        return
+    sent = await safe_send_temp_media(bot, message.chat.id, data, config)
+    if sent:
+        await state.update_data(temp_review_message_id=sent.message_id)
+
+
+async def cleanup_temp_review_media(bot: Bot, state: FSMContext, chat_id: int | str) -> None:
+    data = await state.get_data()
+    message_id = data.get("temp_review_message_id")
+    if not message_id:
+        return
+    try:
+        await bot.delete_message(chat_id, int(message_id))
+    except (TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError) as exc:
+        logging.warning("Could not delete temporary review media: %s", exc)
+
+
 async def after_file_processed(user_id: int, state: FSMContext, bot: Bot, config: "Config") -> None:
+    await cleanup_temp_review_media(bot, state, user_id)
     user_processed_counts[user_id] = user_processed_counts.get(user_id, 0) + 1
     await asyncio.sleep(config.telegram_file_interval)
     await process_next_in_queue(user_id, state, bot, config)
@@ -692,7 +734,8 @@ def required_fields_missing(data: dict) -> list[str]:
     return ["media_type"]
 
 
-async def ask_missing_required_fields(message: Message, state: FSMContext, data: dict, missing: list[str]) -> bool:
+async def ask_missing_required_fields(message: Message, state: FSMContext, bot: Bot, config: Config, data: dict, missing: list[str]) -> bool:
+    await show_temp_review_media(message, state, bot, config, data)
     if data.get("media_type") == "movie":
         if "year" in missing:
             await state.set_state(MediaForm.movie_year)
@@ -740,7 +783,7 @@ async def handle_detected_media(
             await state.clear()
             await after_file_processed(user_id, state, bot, config)
             return True
-        if await ask_missing_required_fields(message, state, merged_data, missing):
+        if await ask_missing_required_fields(message, state, bot, config, merged_data, missing):
             return True
         return False
 
@@ -1005,8 +1048,7 @@ def build_caption(data: dict) -> str:
 
 
 def current_file_label(data: dict) -> str:
-    file_name = data.get("file_name") or "archivo actual"
-    return f"Archivo actual: <code>{file_name}</code>\n"
+    return ""
 
 
 def is_allowed(config: Config, user_id: int | None) -> bool:
@@ -1050,6 +1092,7 @@ async def reject_if_not_allowed(message: Message, config: Config) -> bool:
 async def start(message: Message, state: FSMContext, config: Config) -> None:
     if await reject_if_not_allowed(message, config):
         return
+    await cleanup_temp_review_media(message.bot, state, message.chat.id)
     await state.clear()
     await safe_answer(
         message,
@@ -1221,11 +1264,11 @@ async def review_command(message: Message, state: FSMContext, config: Config) ->
     video_info = video_info_from_pending(row)
     await state.clear()
     await state.update_data(**video_info, quality=row.get("quality"), pending_review_id=row["id"])
+    await show_temp_review_media(message, state, message.bot, config, video_info)
     await state.set_state(MediaForm.choosing_type)
     await safe_answer(
         message,
         f"Revisando pendiente #{row['id']}\n"
-        f"Archivo actual: <code>{row['file_name']}</code>\n"
         f"Motivo: {row.get('reason') or 'requiere asistencia'}\n\n"
         "¿Es película o serie?",
         reply_markup=type_keyboard(),
@@ -1321,7 +1364,7 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                     await state.clear()
                     await after_file_processed(user_id, state, bot, config)
                     return
-                if await ask_missing_required_fields(message, state, merged_data, missing):
+                if await ask_missing_required_fields(message, state, bot, config, merged_data, missing):
                     return
 
             try:
@@ -1412,6 +1455,10 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
         try:
             published = await publish_media(bot, config, data, data["caption"])
             
+            pending_id = data.get("pending_review_id")
+            if pending_id:
+                mark_pending_review_done(config, int(pending_id))
+            await cleanup_temp_review_media(bot, state, callback.from_user.id)
             await state.clear()
             await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente." if published else "⏭️ Duplicado omitido; ya estaba publicado.", config=config)
         except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
@@ -1423,6 +1470,7 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
     # Si elige editar manual, vamos a la selección de tipo
     await callback.answer()
     data = await state.get_data()
+    await show_temp_review_media(callback.message, state, bot, config, data)
     quality = data.get("quality")
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
     
@@ -1439,6 +1487,7 @@ async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config
     await callback.answer()
     
     data = await state.get_data()
+    await show_temp_review_media(callback.message, state, callback.bot, config, data)
     tmdb_data = data.get("tmdb_data", {})
     quality = data.get("quality")
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
@@ -1473,15 +1522,15 @@ async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config
     media_type = callback.data.split(":", 1)[1]
     await callback.answer()
     await state.update_data(media_type=media_type)
+    data = await state.get_data()
+    await show_temp_review_media(callback.message, state, callback.bot, config, data)
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_name)
-        data = await state.get_data()
         await safe_answer(callback.message, current_file_label(data) + "Título de la película. Ejemplo: Ghosted")
         return
 
     await state.set_state(MediaForm.series_name)
-    data = await state.get_data()
     await safe_answer(callback.message, current_file_label(data) + "Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
 
 
