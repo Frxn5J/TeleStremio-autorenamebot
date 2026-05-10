@@ -18,10 +18,11 @@ Configura estas variables en Coolify:
 BOT_TOKEN=token_de_botfather
 TARGET_CHANNEL_ID=-1001234567890
 ALLOWED_USER_IDS=
-OMDB_API_KEY=tu_api_key_de_omdb_aqui
+TMDB_API_KEY=tu_api_key_de_tmdb_aqui
 LLM_API_KEY=tu_api_key_del_llm
 LLM_BASE_URL=https://api.tu-proveedor.com/v1
 LLM_MODEL=nombre-del-modelo
+LLM_AUTO_POST=false
 ```
 
 `BOT_TOKEN`: token de BotFather.
@@ -30,7 +31,7 @@ LLM_MODEL=nombre-del-modelo
 
 `ALLOWED_USER_IDS`: opcional. IDs de usuarios permitidos separados por coma, por ejemplo `123,456`. Si lo dejas vacío, cualquier usuario puede usarlo.
 
-`OMDB_API_KEY`: opcional. API Key de OMDb (obtenla en omdbapi.com). Si la configuras, el bot intentará buscar el título en IMDb usando el nombre del archivo y te preguntará si es correcto para ahorrarte escribir el título y el año.
+`TMDB_API_KEY`: opcional. API Key de TMDB. Si la configuras, el bot intentará buscar el título en The Movie Database usando el nombre del archivo y te preguntará si es correcto para ahorrarte escribir el título y el año.
 
 `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`: opcionales. Permite conectar el bot a un LLM compatible con la API de OpenAI (Groq, Together, Ollama, etc.). Si está configurado, el bot usará inteligencia artificial para leer el nombre del archivo (y su texto adjunto) y extraer automáticamente si es película o serie, el título, año, temporada, episodio y calidad. Te mostrará el resultado listo para enviar con un solo botón.
 

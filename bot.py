@@ -36,7 +36,7 @@ QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNO
 
 class MediaForm(StatesGroup):
     confirming_llm = State()
-    confirming_omdb = State()
+    confirming_tmdb = State()
     choosing_type = State()
     movie_name = State()
     movie_year = State()
@@ -55,7 +55,7 @@ class Config:
     bot_token: str
     target_channel_id: int | str
     allowed_user_ids: set[int]
-    omdb_api_key: str
+    tmdb_api_key: str
     llm_api_key: str
     llm_base_url: str
     llm_model: str
@@ -65,7 +65,7 @@ class Config:
 def load_config() -> Config:
     token = os.getenv("BOT_TOKEN", "").strip()
     channel = os.getenv("TARGET_CHANNEL_ID", "").strip()
-    omdb_key = os.getenv("OMDB_API_KEY", "").strip()
+    tmdb_key = os.getenv("TMDB_API_KEY", "").strip()
     llm_key = os.getenv("LLM_API_KEY", "").strip()
     llm_url = os.getenv("LLM_BASE_URL", "").strip()
     llm_model = os.getenv("LLM_MODEL", "").strip()
@@ -88,7 +88,7 @@ def load_config() -> Config:
         bot_token=token, 
         target_channel_id=target_channel_id, 
         allowed_user_ids=allowed, 
-        omdb_api_key=omdb_key,
+        tmdb_api_key=tmdb_key,
         llm_api_key=llm_key,
         llm_base_url=llm_url,
         llm_model=llm_model,
@@ -107,12 +107,12 @@ def llm_confirm_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def omdb_confirm_keyboard() -> InlineKeyboardMarkup:
+def tmdb_confirm_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Sí, es correcto", callback_data="omdb:yes"),
-                InlineKeyboardButton(text="No, continuar manual", callback_data="omdb:no"),
+                InlineKeyboardButton(text="Sí, es correcto", callback_data="tmdb:yes"),
+                InlineKeyboardButton(text="No, continuar manual", callback_data="tmdb:no"),
             ]
         ]
     )
@@ -183,19 +183,26 @@ def clean_filename_for_search(file_name: str) -> str:
     return name.strip()
 
 
-async def search_omdb(query: str, api_key: str) -> dict | None:
+async def search_tmdb(query: str, api_key: str) -> dict | None:
     if not api_key or not query:
         return None
-    url = f"http://www.omdbapi.com/?t={urllib.parse.quote(query)}&apikey={api_key}"
+    params = {
+        "api_key": api_key,
+        "query": query,
+        "include_adult": "false",
+        "language": "es-ES",
+    }
+    url = f"https://api.themoviedb.org/3/search/multi?{urllib.parse.urlencode(params)}"
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=5) as response:
                 if response.status == 200:
                     data = await response.json()
-                    if data.get("Response") == "True":
-                        return data
+                    for item in data.get("results", []):
+                        if item.get("media_type") in {"movie", "tv"}:
+                            return item
     except Exception as e:
-        logging.error(f"Error searching OMDB: {e}")
+        logging.error(f"Error searching TMDB: {e}")
     return None
 
 
@@ -420,21 +427,23 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             except KeyError as e:
                 logging.error(f"LLM data missing key for build_caption: {e}")
 
-    # 2. Intentar con OMDB si LLM no está o falló
-    if config.omdb_api_key:
+    # 2. Intentar con TMDB si LLM no está o falló
+    if config.tmdb_api_key:
         search_query = clean_filename_for_search(video_info["file_name"])
         if search_query:
-            omdb_data = await search_omdb(search_query, config.omdb_api_key)
-            if omdb_data:
-                await state.set_state(MediaForm.confirming_omdb)
-                await state.update_data(omdb_data=omdb_data)
+            tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
+            if tmdb_data:
+                await state.set_state(MediaForm.confirming_tmdb)
+                await state.update_data(tmdb_data=tmdb_data)
                 
-                title = omdb_data.get("Title", "Desconocido")
-                year = omdb_data.get("Year", "Desconocido")
-                kind = omdb_data.get("Type", "Desconocido")
+                media_type = tmdb_data.get("media_type", "Desconocido")
+                title = tmdb_data.get("title") or tmdb_data.get("name") or "Desconocido"
+                date = tmdb_data.get("release_date") or tmdb_data.get("first_air_date") or ""
+                year = date[:4] if date else "Desconocido"
+                kind = "Serie" if media_type == "tv" else "Película"
                 
-                text = f"Encontré esto en IMDb:\n\n<b>{title}</b> ({year}) - {kind.capitalize()}\n\n¿Es correcto?"
-                await message.answer(text, reply_markup=omdb_confirm_keyboard())
+                text = f"Encontré esto en TMDB:\n\n<b>{title}</b> ({year}) - {kind}\n\n¿Es correcto?"
+                await message.answer(text, reply_markup=tmdb_confirm_keyboard())
                 return
 
     await state.set_state(MediaForm.choosing_type)
@@ -494,7 +503,7 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
     await callback.message.answer(f"Modo manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
 
 
-async def handle_omdb_confirm(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
     if not is_allowed(config, callback.from_user.id if callback.from_user else None):
         await callback.answer("No autorizado", show_alert=True)
         return
@@ -503,7 +512,7 @@ async def handle_omdb_confirm(callback: CallbackQuery, state: FSMContext, config
     await callback.answer()
     
     data = await state.get_data()
-    omdb_data = data.get("omdb_data", {})
+    tmdb_data = data.get("tmdb_data", {})
     quality = data.get("quality")
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
 
@@ -512,20 +521,21 @@ async def handle_omdb_confirm(callback: CallbackQuery, state: FSMContext, config
         await callback.message.answer(f"Ok, continuemos manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
         return
 
-    # User confirmed OMDB data
-    media_type = "series" if omdb_data.get("Type") == "series" else "movie"
+    media_type = "series" if tmdb_data.get("media_type") == "tv" else "movie"
+    title = tmdb_data.get("title") or tmdb_data.get("name") or ""
+    date = tmdb_data.get("release_date") or tmdb_data.get("first_air_date") or ""
     await state.update_data(
         media_type=media_type,
-        name=omdb_data.get("Title", ""),
-        year=omdb_data.get("Year", "")[:4] # Sometimes year is "2023–"
+        name=title,
+        year=date[:4]
     )
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_quality)
-        await callback.message.answer(f"Película: {omdb_data.get('Title')} ({omdb_data.get('Year')[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
+        await callback.message.answer(f"Película: {title} ({date[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
     else:
         await state.set_state(MediaForm.series_season)
-        await callback.message.answer(f"Serie: {omdb_data.get('Title')}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
+        await callback.message.answer(f"Serie: {title}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
 
 
 async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
@@ -666,7 +676,7 @@ async def main() -> None:
     dp.message.register(lambda message, state: cancel(message, state, bot, config), F.text.casefold() == "/cancel")
     dp.message.register(lambda message, state: receive_video(message, state, bot, config), F.video | F.document)
     dp.callback_query.register(lambda callback, state: handle_llm_confirm(callback, state, bot, config), F.data.startswith("llm:"), MediaForm.confirming_llm)
-    dp.callback_query.register(lambda callback, state: handle_omdb_confirm(callback, state, config), F.data.startswith("omdb:"), MediaForm.confirming_omdb)
+    dp.callback_query.register(lambda callback, state: handle_tmdb_confirm(callback, state, config), F.data.startswith("tmdb:"), MediaForm.confirming_tmdb)
     dp.callback_query.register(lambda callback, state: choose_type(callback, state, config), F.data.startswith("type:"), MediaForm.choosing_type)
     dp.message.register(movie_name, MediaForm.movie_name)
     dp.message.register(movie_year, MediaForm.movie_year)
