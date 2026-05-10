@@ -56,7 +56,7 @@ DATABASE_PATH=/app/data/bot.sqlite3
 
 `QUEUE_NOTIFY_EVERY`: cada cuántos archivos pendientes avisa el bot en cargas masivas.
 
-`DATABASE_PATH`: ruta del archivo SQLite persistente. En Coolify monta un volumen en `/app/data` para conservar la base entre redeploys.
+`DATABASE_PATH`: ruta del archivo SQLite persistente. En Coolify monta un volumen en `/app/data` para conservar la base entre redeploys. La base guarda publicaciones para evitar duplicados y también los cambios hechos con comandos como `/autopost`, `/debug`, `/setchannel` y `/speed`.
 
 ## Despliegue rápido en Coolify
 
@@ -83,7 +83,7 @@ Estos comandos solo funcionan en chat privado con el bot:
 /config - Ver configuración actual
 /autopost on|off - Activar/desactivar auto-publicación
 /debug on|off - Activar/desactivar logs del LLM
-/setchannel -1001234567890 - Cambiar canal destino hasta reiniciar
+/setchannel -1001234567890 - Cambiar canal destino y guardarlo en SQLite
 /speed safe|normal|fast - Cambiar velocidad de procesamiento
 /queue - Ver videos pendientes en cola
 /clearqueue - Vaciar cola pendiente

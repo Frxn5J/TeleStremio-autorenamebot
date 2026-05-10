@@ -73,6 +73,55 @@ def init_database(config: "Config") -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def save_setting(config: "Config", key: str, value: object) -> None:
+    with sqlite3.connect(config.database_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+            """,
+            (key, str(value), int(time.time())),
+        )
+
+
+def load_settings(config: "Config") -> dict[str, str]:
+    with sqlite3.connect(config.database_path) as conn:
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
+    return {key: value for key, value in rows}
+
+
+def apply_persisted_settings(config: "Config") -> None:
+    settings = load_settings(config)
+    if "target_channel_id" in settings:
+        parsed = parse_target_channel(settings["target_channel_id"])
+        if parsed is not None:
+            config.target_channel_id = parsed
+    if "llm_auto_post" in settings:
+        parsed = parse_bool_arg(settings["llm_auto_post"])
+        if parsed is not None:
+            config.llm_auto_post = parsed
+    if "llm_debug" in settings:
+        parsed = parse_bool_arg(settings["llm_debug"])
+        if parsed is not None:
+            config.llm_debug = parsed
+    if "telegram_min_interval" in settings:
+        config.telegram_min_interval = float(settings["telegram_min_interval"])
+    if "telegram_file_interval" in settings:
+        config.telegram_file_interval = float(settings["telegram_file_interval"])
+    if "queue_notify_every" in settings:
+        config.queue_notify_every = int(settings["queue_notify_every"])
 
 
 def dedupe_key(caption: str) -> str:
@@ -970,6 +1019,7 @@ async def autopost_command(message: Message, config: Config) -> None:
         await safe_answer(message, "Valor inválido. Usa /autopost on o /autopost off.")
         return
     config.llm_auto_post = value
+    save_setting(config, "llm_auto_post", "true" if value else "false")
     await safe_answer(message, f"Auto-post cambiado a {'on' if value else 'off'}.")
 
 
@@ -985,6 +1035,7 @@ async def debug_command(message: Message, config: Config) -> None:
         await safe_answer(message, "Valor inválido. Usa /debug on o /debug off.")
         return
     config.llm_debug = value
+    save_setting(config, "llm_debug", "true" if value else "false")
     await safe_answer(message, f"LLM debug cambiado a {'on' if value else 'off'}.")
 
 
@@ -996,7 +1047,8 @@ async def setchannel_command(message: Message, config: Config) -> None:
         await safe_answer(message, "Uso: /setchannel -1001234567890 o /setchannel @nombre_del_canal")
         return
     config.target_channel_id = target
-    await safe_answer(message, f"Canal destino cambiado a <code>{target}</code>. Este cambio dura hasta reiniciar el bot.")
+    save_setting(config, "target_channel_id", target)
+    await safe_answer(message, f"Canal destino cambiado a <code>{target}</code> y guardado en SQLite.")
 
 
 async def speed_command(message: Message, config: Config) -> None:
@@ -1023,6 +1075,9 @@ async def speed_command(message: Message, config: Config) -> None:
         await safe_answer(message, "Valor inválido. Usa /speed safe, /speed normal o /speed fast.")
         return
 
+    save_setting(config, "telegram_min_interval", config.telegram_min_interval)
+    save_setting(config, "telegram_file_interval", config.telegram_file_interval)
+    save_setting(config, "queue_notify_every", config.queue_notify_every)
     await safe_answer(message, f"Velocidad cambiada a {args}: min={config.telegram_min_interval}s, archivo={config.telegram_file_interval}s, aviso cada {config.queue_notify_every}.")
 
 
@@ -1469,6 +1524,7 @@ async def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     config = load_config()
     init_database(config)
+    apply_persisted_settings(config)
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
