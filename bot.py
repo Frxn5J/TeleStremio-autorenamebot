@@ -95,6 +95,7 @@ class Config:
     llm_base_url: str
     llm_model: str
     llm_auto_post: bool
+    llm_debug: bool
 
 
 def load_config() -> Config:
@@ -105,6 +106,7 @@ def load_config() -> Config:
     llm_url = os.getenv("LLM_BASE_URL", "").strip()
     llm_model = os.getenv("LLM_MODEL", "").strip()
     llm_auto_post = os.getenv("LLM_AUTO_POST", "false").strip().lower() == "true"
+    llm_debug = os.getenv("LLM_DEBUG", "false").strip().lower() == "true"
 
     if not token:
         raise RuntimeError("Falta BOT_TOKEN en las variables de entorno.")
@@ -127,7 +129,8 @@ def load_config() -> Config:
         llm_api_key=llm_key,
         llm_base_url=llm_url,
         llm_model=llm_model,
-        llm_auto_post=llm_auto_post
+        llm_auto_post=llm_auto_post,
+        llm_debug=llm_debug
     )
 
 
@@ -281,6 +284,10 @@ Para series:
 Solo devuelve el JSON, sin texto adicional ni markdown.
 """
     try:
+        if config.llm_debug:
+            logging.info("LLM request model=%s base_url=%s filename=%r caption=%r", config.llm_model, config.llm_base_url or "default", filename, caption)
+            logging.info("LLM prompt:\n%s", prompt)
+
         response = await client.chat.completions.create(
             model=config.llm_model,
             messages=[{"role": "user", "content": prompt}],
@@ -288,11 +295,17 @@ Solo devuelve el JSON, sin texto adicional ni markdown.
             max_tokens=300
         )
         content = response.choices[0].message.content or ""
+        if config.llm_debug:
+            logging.info("LLM raw response:\n%s", content)
+
         content = content.strip("` \n")
         if content.startswith("json"):
             content = content[4:].strip()
             
         data = json.loads(content)
+        if config.llm_debug:
+            logging.info("LLM parsed JSON: %s", json.dumps(data, ensure_ascii=False))
+
         if data.get("media_type") in ("movie", "series"):
             return data
     except Exception as e:

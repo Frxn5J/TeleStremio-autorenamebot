@@ -23,6 +23,7 @@ LLM_API_KEY=tu_api_key_del_llm
 LLM_BASE_URL=https://api.tu-proveedor.com/v1
 LLM_MODEL=nombre-del-modelo
 LLM_AUTO_POST=false
+LLM_DEBUG=false
 ```
 
 `BOT_TOKEN`: token de BotFather.
@@ -36,6 +37,8 @@ LLM_AUTO_POST=false
 `LLM_API_KEY`, `LLM_BASE_URL`, `LLM_MODEL`: opcionales. Permite conectar el bot a un LLM compatible con la API de OpenAI (Groq, Together, Ollama, etc.). Si está configurado, el bot usará inteligencia artificial para leer el nombre del archivo (y su texto adjunto) y extraer automáticamente si es película o serie, el título, año, temporada, episodio y calidad. Te mostrará el resultado listo para enviar con un solo botón.
 
 `LLM_AUTO_POST`: opcional (`true` o `false`). Si está en `true` y el LLM logra extraer los datos correctamente, el bot publicará el video en el canal inmediatamente sin pedirte confirmación y pasará al siguiente video de la cola. Ideal para envíos masivos.
+
+`LLM_DEBUG`: opcional (`true` o `false`). Si está en `true`, el bot mostrará en los logs el prompt enviado al LLM, la respuesta cruda y el JSON parseado. Úsalo solo para depurar porque puede mostrar nombres de archivos o textos privados.
 
 ## Despliegue rápido en Coolify
 
