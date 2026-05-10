@@ -221,6 +221,46 @@ def clean_filename_for_search(file_name: str) -> str:
     return name.strip()
 
 
+def extract_llm_content(response: object) -> str:
+    if isinstance(response, str):
+        return response
+
+    if isinstance(response, dict):
+        choices = response.get("choices") or []
+        if choices:
+            message = choices[0].get("message") or {}
+            content = message.get("content")
+            if content is not None:
+                return str(content)
+        content = response.get("content") or response.get("text")
+        return str(content) if content is not None else json.dumps(response, ensure_ascii=False)
+
+    choices = getattr(response, "choices", None)
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None) if message else None
+        if content is not None:
+            return str(content)
+
+    return str(response)
+
+
+def extract_json_object(text: str) -> dict:
+    content = text.strip()
+    if content.startswith("```"):
+        content = content.strip("` \n")
+    if content.lower().startswith("json"):
+        content = content[4:].strip()
+
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", content, flags=re.DOTALL)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
 async def search_tmdb(query: str, api_key: str) -> dict | None:
     if not api_key or not query:
         return None
@@ -294,15 +334,12 @@ Solo devuelve el JSON, sin texto adicional ni markdown.
             temperature=0.1,
             max_tokens=300
         )
-        content = response.choices[0].message.content or ""
+        content = extract_llm_content(response)
         if config.llm_debug:
+            logging.info("LLM response type: %s", type(response).__name__)
             logging.info("LLM raw response:\n%s", content)
 
-        content = content.strip("` \n")
-        if content.startswith("json"):
-            content = content[4:].strip()
-            
-        data = json.loads(content)
+        data = extract_json_object(content)
         if config.llm_debug:
             logging.info("LLM parsed JSON: %s", json.dumps(data, ensure_ascii=False))
 
