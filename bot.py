@@ -11,7 +11,7 @@ import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -33,6 +33,9 @@ async def safe_answer(target: Message, text: str, **kwargs) -> None:
         try:
             await target.answer(text, **kwargs)
             return
+        except TelegramRetryAfter as exc:
+            logging.warning("Telegram flood control sending message, retry after %s seconds", exc.retry_after)
+            await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
             logging.warning("Telegram timeout sending message, attempt %s/3: %s", attempt + 1, exc)
             await asyncio.sleep(1 + attempt)
@@ -43,6 +46,9 @@ async def safe_send_message(bot: Bot, chat_id: int | str, text: str, **kwargs) -
         try:
             await bot.send_message(chat_id, text, **kwargs)
             return
+        except TelegramRetryAfter as exc:
+            logging.warning("Telegram flood control sending direct message, retry after %s seconds", exc.retry_after)
+            await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
             logging.warning("Telegram timeout sending direct message, attempt %s/3: %s", attempt + 1, exc)
             await asyncio.sleep(1 + attempt)
@@ -56,6 +62,9 @@ async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str
             else:
                 await bot.send_document(chat_id, data["file_id"], caption=caption)
             return
+        except TelegramRetryAfter as exc:
+            logging.warning("Telegram flood control sending media, retry after %s seconds", exc.retry_after)
+            await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
             logging.warning("Telegram timeout sending media, attempt %s/3: %s", attempt + 1, exc)
             await asyncio.sleep(2 + attempt)
@@ -902,8 +911,8 @@ async def receive_video(message: Message, state: FSMContext, bot: Bot, config: C
     user_queues[user_id].append(message)
     
     queue_length = len(user_queues[user_id])
-    if queue_length > 1:
-        await safe_answer(message, f"📥 Video añadido a la cola (Posición: {queue_length}).")
+    if queue_length in {2, 5, 10} or (queue_length > 10 and queue_length % 10 == 0):
+        await safe_answer(message, f"📥 Videos pendientes en cola: {queue_length}.")
         
     if not user_processing.get(user_id, False):
         await process_next_in_queue(user_id, state, bot, config)
