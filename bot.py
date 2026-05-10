@@ -200,6 +200,10 @@ MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", 
 SEASON_RE = re.compile(r"^S\d{2,}$", re.IGNORECASE)
 EPISODE_RE = re.compile(r"^E\d{2,}$", re.IGNORECASE)
 QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNORECASE)
+GENERIC_TITLE_RE = re.compile(
+    r"^(?:video|videos|vid|movie|movies|film|pelicula|película|archivo|file|document|documento|clip|media|telegram|download|upload|untitled|sin titulo|sin título)\s*\d*$",
+    re.IGNORECASE,
+)
 SEASON_EPISODE_TEXT_RE = re.compile(
     r"(?P<title>.*?)"
     r"(?:\b(?:temp|temporada|season|t)\.?\s*(?P<season>\d{1,2})\b)"
@@ -381,6 +385,32 @@ def clean_filename_for_search(file_name: str) -> str:
     return name.strip()
 
 
+def is_generic_title(value: str) -> bool:
+    normalized = normalize_metadata_text(value).lower()
+    normalized = QUALITY_RE.sub("", normalized)
+    normalized = re.sub(r"\b(19|20)\d{2}\b", "", normalized)
+    normalized = clean_text(normalized).strip(" .-_")
+    if not normalized:
+        return True
+    if GENERIC_TITLE_RE.fullmatch(normalized):
+        return True
+    return len(normalized) < 3
+
+
+def useful_search_text(value: str) -> str | None:
+    cleaned = clean_filename_for_search(value)
+    if is_generic_title(cleaned):
+        return None
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", cleaned)
+    if len(words) < 2 and not re.search(r"\b(19|20)\d{2}\b", value):
+        return None
+    return cleaned
+
+
+def choose_search_query(file_name: str, caption: str) -> str | None:
+    return useful_search_text(caption) or useful_search_text(file_name)
+
+
 def normalize_metadata_text(value: str) -> str:
     value = os.path.splitext(value)[0]
     value = re.sub(r"[._-]+", " ", value)
@@ -479,7 +509,18 @@ def local_parse_media(text: str) -> dict | None:
 
 
 def local_parse_from_sources(file_name: str, caption: str) -> dict | None:
-    return local_parse_media(file_name) or local_parse_media(caption) or local_parse_media(f"{file_name} {caption}")
+    sources = []
+    if caption and not is_generic_title(caption):
+        sources.append(caption)
+    if file_name and not is_generic_title(file_name):
+        sources.append(file_name)
+    if len(sources) == 2:
+        sources.append(f"{file_name} {caption}")
+    for source in sources:
+        parsed = local_parse_media(source)
+        if parsed:
+            return parsed
+    return None
 
 
 def normalize_llm_data(data: dict, fallback_quality: str | None, file_name: str, caption: str) -> dict:
@@ -1075,7 +1116,8 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             return
 
     # 1. Intentar con LLM primero si está configurado
-    if config.llm_api_key and config.llm_model:
+    has_useful_context = bool(choose_search_query(video_info["file_name"], caption_text))
+    if config.llm_api_key and config.llm_model and has_useful_context:
         llm_data = await parse_filename_with_llm(video_info["file_name"], caption_text, quality, config)
         
         if llm_data:
@@ -1118,7 +1160,7 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
 
     # 2. Intentar con TMDB si LLM no está o falló
     if config.tmdb_api_key:
-        search_query = clean_filename_for_search(video_info["file_name"])
+        search_query = choose_search_query(video_info["file_name"], caption_text)
         if search_query:
             tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
             if tmdb_data:
