@@ -24,6 +24,10 @@ LLM_BASE_URL=https://api.tu-proveedor.com/v1
 LLM_MODEL=nombre-del-modelo
 LLM_AUTO_POST=false
 LLM_DEBUG=false
+TELEGRAM_MIN_INTERVAL=1.2
+TELEGRAM_FILE_INTERVAL=2.0
+TELEGRAM_MAX_RETRIES=8
+QUEUE_NOTIFY_EVERY=25
 ```
 
 `BOT_TOKEN`: token de BotFather.
@@ -39,6 +43,14 @@ LLM_DEBUG=false
 `LLM_AUTO_POST`: opcional (`true` o `false`). Si está en `true` y el LLM logra extraer los datos correctamente, el bot publicará el video en el canal inmediatamente sin pedirte confirmación y pasará al siguiente video de la cola. Ideal para envíos masivos.
 
 `LLM_DEBUG`: opcional (`true` o `false`). Si está en `true`, el bot mostrará en los logs el prompt enviado al LLM, la respuesta cruda y el JSON parseado. Úsalo solo para depurar porque puede mostrar nombres de archivos o textos privados.
+
+`TELEGRAM_MIN_INTERVAL`: segundos mínimos entre envíos a Telegram. Sube este valor para colas muy grandes.
+
+`TELEGRAM_FILE_INTERVAL`: pausa entre archivo y archivo cuando procesa la cola.
+
+`TELEGRAM_MAX_RETRIES`: reintentos máximos si Telegram responde con timeout o flood control.
+
+`QUEUE_NOTIFY_EVERY`: cada cuántos archivos pendientes avisa el bot en cargas masivas.
 
 ## Despliegue rápido en Coolify
 
@@ -66,6 +78,7 @@ Estos comandos solo funcionan en chat privado con el bot:
 /autopost on|off - Activar/desactivar auto-publicación
 /debug on|off - Activar/desactivar logs del LLM
 /setchannel -1001234567890 - Cambiar canal destino hasta reiniciar
+/speed safe|normal|fast - Cambiar velocidad de procesamiento
 /queue - Ver videos pendientes en cola
 /clearqueue - Vaciar cola pendiente
 /cancel - Cancelar archivo actual y pasar al siguiente

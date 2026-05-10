@@ -23,40 +23,80 @@ from openai import AsyncOpenAI
 # Diccionario global para manejar las colas por usuario
 user_queues: dict[int, list[Message]] = {}
 user_processing: dict[int, bool] = {}
+user_processed_counts: dict[int, int] = {}
+telegram_send_lock = asyncio.Lock()
+last_telegram_send_at = 0.0
 
 
 MediaType = Literal["movie", "series"]
 
 
+def env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)).strip())
+    except ValueError:
+        return default
+
+
+async def telegram_rate_limit(config: "Config") -> None:
+    global last_telegram_send_at
+    async with telegram_send_lock:
+        now = asyncio.get_running_loop().time()
+        wait_for = config.telegram_min_interval - (now - last_telegram_send_at)
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        last_telegram_send_at = asyncio.get_running_loop().time()
+
+
 async def safe_answer(target: Message, text: str, **kwargs) -> None:
-    for attempt in range(3):
+    config = kwargs.pop("config", None)
+    max_retries = config.telegram_max_retries if config else env_int("TELEGRAM_MAX_RETRIES", 8)
+    for attempt in range(max_retries):
         try:
+            if config:
+                await telegram_rate_limit(config)
             await target.answer(text, **kwargs)
             return
         except TelegramRetryAfter as exc:
             logging.warning("Telegram flood control sending message, retry after %s seconds", exc.retry_after)
             await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
-            logging.warning("Telegram timeout sending message, attempt %s/3: %s", attempt + 1, exc)
-            await asyncio.sleep(1 + attempt)
+            logging.warning("Telegram timeout sending message, attempt %s/%s: %s", attempt + 1, max_retries, exc)
+            await asyncio.sleep(min(60, 2 ** attempt))
+    logging.error("Failed to send Telegram message after %s attempts", max_retries)
 
 
 async def safe_send_message(bot: Bot, chat_id: int | str, text: str, **kwargs) -> None:
-    for attempt in range(3):
+    config = kwargs.pop("config", None)
+    max_retries = config.telegram_max_retries if config else env_int("TELEGRAM_MAX_RETRIES", 8)
+    for attempt in range(max_retries):
         try:
+            if config:
+                await telegram_rate_limit(config)
             await bot.send_message(chat_id, text, **kwargs)
             return
         except TelegramRetryAfter as exc:
             logging.warning("Telegram flood control sending direct message, retry after %s seconds", exc.retry_after)
             await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
-            logging.warning("Telegram timeout sending direct message, attempt %s/3: %s", attempt + 1, exc)
-            await asyncio.sleep(1 + attempt)
+            logging.warning("Telegram timeout sending direct message, attempt %s/%s: %s", attempt + 1, max_retries, exc)
+            await asyncio.sleep(min(60, 2 ** attempt))
+    logging.error("Failed to send Telegram direct message after %s attempts", max_retries)
 
 
-async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str) -> None:
-    for attempt in range(3):
+async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str, config: "Config" | None = None) -> None:
+    max_retries = config.telegram_max_retries if config else env_int("TELEGRAM_MAX_RETRIES", 8)
+    for attempt in range(max_retries):
         try:
+            if config:
+                await telegram_rate_limit(config)
             if data["kind"] == "video":
                 await bot.send_video(chat_id, data["file_id"], caption=caption)
             else:
@@ -66,10 +106,16 @@ async def safe_send_media(bot: Bot, chat_id: int | str, data: dict, caption: str
             logging.warning("Telegram flood control sending media, retry after %s seconds", exc.retry_after)
             await asyncio.sleep(exc.retry_after + 1)
         except TelegramNetworkError as exc:
-            logging.warning("Telegram timeout sending media, attempt %s/3: %s", attempt + 1, exc)
-            await asyncio.sleep(2 + attempt)
+            logging.warning("Telegram timeout sending media, attempt %s/%s: %s", attempt + 1, max_retries, exc)
+            await asyncio.sleep(min(60, 2 ** attempt))
 
     raise TimeoutError("Telegram media send timeout after retries")
+
+
+async def after_file_processed(user_id: int, state: FSMContext, bot: Bot, config: "Config") -> None:
+    user_processed_counts[user_id] = user_processed_counts.get(user_id, 0) + 1
+    await asyncio.sleep(config.telegram_file_interval)
+    await process_next_in_queue(user_id, state, bot, config)
 
 VIDEO_EXTENSIONS = {".mkv", ".mp4"}
 MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", re.IGNORECASE)
@@ -117,6 +163,10 @@ class Config:
     llm_model: str
     llm_auto_post: bool
     llm_debug: bool
+    telegram_min_interval: float
+    telegram_file_interval: float
+    telegram_max_retries: int
+    queue_notify_every: int
 
 
 def load_config() -> Config:
@@ -128,6 +178,10 @@ def load_config() -> Config:
     llm_model = os.getenv("LLM_MODEL", "").strip()
     llm_auto_post = os.getenv("LLM_AUTO_POST", "false").strip().lower() == "true"
     llm_debug = os.getenv("LLM_DEBUG", "false").strip().lower() == "true"
+    telegram_min_interval = env_float("TELEGRAM_MIN_INTERVAL", 1.2)
+    telegram_file_interval = env_float("TELEGRAM_FILE_INTERVAL", 2.0)
+    telegram_max_retries = env_int("TELEGRAM_MAX_RETRIES", 8)
+    queue_notify_every = env_int("QUEUE_NOTIFY_EVERY", 25)
 
     if not token:
         raise RuntimeError("Falta BOT_TOKEN en las variables de entorno.")
@@ -151,7 +205,11 @@ def load_config() -> Config:
         llm_base_url=llm_url,
         llm_model=llm_model,
         llm_auto_post=llm_auto_post,
-        llm_debug=llm_debug
+        llm_debug=llm_debug,
+        telegram_min_interval=telegram_min_interval,
+        telegram_file_interval=telegram_file_interval,
+        telegram_max_retries=telegram_max_retries,
+        queue_notify_every=queue_notify_every,
     )
 
 
@@ -642,6 +700,7 @@ async def help_command(message: Message, config: Config) -> None:
         "/autopost on|off - Activar/desactivar auto-publicación\n"
         "/debug on|off - Activar/desactivar logs del LLM\n"
         "/setchannel -1001234567890 o @canal - Cambiar canal destino hasta reiniciar\n"
+        "/speed safe|normal|fast - Cambiar velocidad de cola\n"
         "/queue - Ver videos pendientes en cola\n"
         "/clearqueue - Vaciar cola pendiente\n"
         "/cancel - Cancelar archivo actual y pasar al siguiente",
@@ -662,6 +721,10 @@ async def config_command(message: Message, config: Config) -> None:
         f"LLM debug: {'on' if config.llm_debug else 'off'}\n"
         f"LLM configurado: {'sí' if config.llm_api_key and config.llm_model else 'no'}\n"
         f"TMDB configurado: {'sí' if config.tmdb_api_key else 'no'}\n"
+        f"Intervalo Telegram: {config.telegram_min_interval}s\n"
+        f"Pausa por archivo: {config.telegram_file_interval}s\n"
+        f"Reintentos Telegram: {config.telegram_max_retries}\n"
+        f"Aviso de cola cada: {config.queue_notify_every}\n"
         f"Usuarios permitidos: {'todos' if not config.allowed_user_ids else len(config.allowed_user_ids)}\n"
         f"Procesando ahora: {processing}\n"
         f"Pendientes en cola: {queue_len}",
@@ -707,6 +770,33 @@ async def setchannel_command(message: Message, config: Config) -> None:
         return
     config.target_channel_id = target
     await safe_answer(message, f"Canal destino cambiado a <code>{target}</code>. Este cambio dura hasta reiniciar el bot.")
+
+
+async def speed_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    args = command_args(message).lower()
+    if not args:
+        await safe_answer(message, f"Velocidad actual: min={config.telegram_min_interval}s, archivo={config.telegram_file_interval}s. Usa /speed safe, /speed normal o /speed fast.")
+        return
+
+    if args == "safe":
+        config.telegram_min_interval = 2.0
+        config.telegram_file_interval = 4.0
+        config.queue_notify_every = 100
+    elif args == "normal":
+        config.telegram_min_interval = 1.2
+        config.telegram_file_interval = 2.0
+        config.queue_notify_every = 25
+    elif args == "fast":
+        config.telegram_min_interval = 0.6
+        config.telegram_file_interval = 1.0
+        config.queue_notify_every = 25
+    else:
+        await safe_answer(message, "Valor inválido. Usa /speed safe, /speed normal o /speed fast.")
+        return
+
+    await safe_answer(message, f"Velocidad cambiada a {args}: min={config.telegram_min_interval}s, archivo={config.telegram_file_interval}s, aviso cada {config.queue_notify_every}.")
 
 
 async def queue_command(message: Message, config: Config) -> None:
@@ -756,10 +846,12 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     queue = user_queues.get(user_id, [])
     if not queue:
         user_processing[user_id] = False
-        await safe_send_message(bot, user_id, "✅ Todos los videos en cola han sido procesados.")
+        processed = user_processed_counts.pop(user_id, 0)
+        await safe_send_message(bot, user_id, f"✅ Cola terminada. Archivos procesados: {processed}.", config=config)
         return
 
     user_processing[user_id] = True
+    user_processed_counts.setdefault(user_id, 0)
     message = queue.pop(0)
     
     # Rest of the receive_video logic goes here, but we pass the message
@@ -767,22 +859,23 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     
     video_info = get_video_info(message)
     if not video_info:
-        await safe_answer(message, "Archivo omitido: no es un video válido .mkv o .mp4.")
-        await process_next_in_queue(user_id, state, bot, config)
+        await safe_answer(message, "Archivo omitido: no es un video válido .mkv o .mp4.", config=config)
+        await after_file_processed(user_id, state, bot, config)
         return
 
     if is_multipart(video_info["file_name"]):
-        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> multipart detectado y omitido automáticamente.")
-        await process_next_in_queue(user_id, state, bot, config)
+        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> multipart detectado y omitido automáticamente.", config=config)
+        await after_file_processed(user_id, state, bot, config)
         return
 
     ext = get_extension(video_info["file_name"])
     if ext and ext not in VIDEO_EXTENSIONS:
-        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> omitido: La extensión debe ser .mkv o .mp4.")
-        await process_next_in_queue(user_id, state, bot, config)
+        await safe_answer(message, f"Archivo <b>{video_info['file_name']}</b> omitido: La extensión debe ser .mkv o .mp4.", config=config)
+        await after_file_processed(user_id, state, bot, config)
         return
 
-    await safe_answer(message, f"⏳ Procesando: <b>{video_info['file_name']}</b>...")
+    if not config.llm_auto_post:
+        await safe_answer(message, f"⏳ Procesando: <b>{video_info['file_name']}</b>...", config=config)
 
     caption_text = message.caption or ""
     combined_text = f"{video_info['file_name']} {caption_text}"
@@ -818,14 +911,13 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 
                 if config.llm_auto_post:
                     try:
-                        await safe_send_media(bot, config.target_channel_id, video_info, caption)
+                        await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
                         
-                        await safe_answer(message, f"✅ Auto-publicado: <code>{caption}</code>")
                         await state.clear()
-                        await process_next_in_queue(user_id, state, bot, config)
+                        await after_file_processed(user_id, state, bot, config)
                         return
                     except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
-                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
+                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
                         # Si falla el auto-post, cae al flujo manual normal
                 
                 await state.set_state(MediaForm.confirming_llm)
@@ -860,13 +952,12 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 await state.update_data(caption=caption)
                 if config.llm_auto_post:
                     try:
-                        await safe_send_media(bot, config.target_channel_id, video_info, caption)
-                        await safe_answer(message, f"✅ Auto-publicado: <code>{caption}</code>")
+                        await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
                         await state.clear()
-                        await process_next_in_queue(user_id, state, bot, config)
+                        await after_file_processed(user_id, state, bot, config)
                         return
                     except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
-                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
+                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
                 await state.set_state(MediaForm.confirming_llm)
                 await safe_answer(message, f"Detección local:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?", reply_markup=llm_confirm_keyboard())
                 return
@@ -911,8 +1002,9 @@ async def receive_video(message: Message, state: FSMContext, bot: Bot, config: C
     user_queues[user_id].append(message)
     
     queue_length = len(user_queues[user_id])
-    if queue_length in {2, 5, 10} or (queue_length > 10 and queue_length % 10 == 0):
-        await safe_answer(message, f"📥 Videos pendientes en cola: {queue_length}.")
+    notify_every = max(1, config.queue_notify_every)
+    if queue_length in {2, 10} or (queue_length > 10 and queue_length % notify_every == 0):
+        await safe_answer(message, f"📥 Videos pendientes en cola: {queue_length}.", config=config)
         
     if not user_processing.get(user_id, False):
         await process_next_in_queue(user_id, state, bot, config)
@@ -929,14 +1021,14 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
         await callback.answer()
         data = await state.get_data()
         try:
-            await safe_send_media(bot, config.target_channel_id, data, data["caption"])
+            await safe_send_media(bot, config.target_channel_id, data, data["caption"], config=config)
             
             await state.clear()
-            await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente.")
+            await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente.", config=config)
         except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
-            await safe_answer(callback.message, f"Error enviando al canal: {exc}")
+            await safe_answer(callback.message, f"Error enviando al canal: {exc}", config=config)
             
-        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        await after_file_processed(callback.from_user.id, state, bot, config)
         return
 
     # Si elige editar manual, vamos a la selección de tipo
@@ -1152,27 +1244,27 @@ async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: 
     action = callback.data.split(":", 1)[1]
     if action == "cancel":
         await callback.answer("Cancelado")
-        await safe_answer(callback.message, "Operación cancelada para este archivo.")
-        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        await safe_answer(callback.message, "Operación cancelada para este archivo.", config=config)
+        await after_file_processed(callback.from_user.id, state, bot, config)
         return
 
     data = await state.get_data()
     try:
-        await safe_send_media(bot, config.target_channel_id, data, data["caption"])
+        await safe_send_media(bot, config.target_channel_id, data, data["caption"], config=config)
     except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
         await callback.answer("No se pudo enviar", show_alert=True)
-        await safe_answer(callback.message, f"Error enviando al canal: {exc}")
-        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        await safe_answer(callback.message, f"Error enviando al canal: {exc}", config=config)
+        await after_file_processed(callback.from_user.id, state, bot, config)
         return
 
     await callback.answer("Enviado")
-    await safe_answer(callback.message, "✅ Archivo enviado al canal.")
-    await process_next_in_queue(callback.from_user.id, state, bot, config)
+    await safe_answer(callback.message, "✅ Archivo enviado al canal.", config=config)
+    await after_file_processed(callback.from_user.id, state, bot, config)
 
 
 async def cancel(message: Message, state: FSMContext, bot: Bot, config: Config) -> None:
-    await safe_answer(message, "Operación cancelada para este archivo.")
-    await process_next_in_queue(message.from_user.id, state, bot, config)
+    await safe_answer(message, "Operación cancelada para este archivo.", config=config)
+    await after_file_processed(message.from_user.id, state, bot, config)
 
 
 async def main() -> None:
@@ -1198,6 +1290,9 @@ async def main() -> None:
 
     async def setchannel_handler(message: Message) -> None:
         await setchannel_command(message, config)
+
+    async def speed_handler(message: Message) -> None:
+        await speed_command(message, config)
 
     async def queue_handler(message: Message) -> None:
         await queue_command(message, config)
@@ -1243,6 +1338,7 @@ async def main() -> None:
     dp.message.register(autopost_handler, Command("autopost"), private_chat)
     dp.message.register(debug_handler, Command("debug"), private_chat)
     dp.message.register(setchannel_handler, Command("setchannel"), private_chat)
+    dp.message.register(speed_handler, Command("speed"), private_chat)
     dp.message.register(queue_handler, Command("queue"), private_chat)
     dp.message.register(clearqueue_handler, Command("clearqueue"), private_chat)
     dp.message.register(cancel_handler, F.text.casefold() == "/cancel", private_chat)
