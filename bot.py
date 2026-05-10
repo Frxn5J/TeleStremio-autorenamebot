@@ -82,6 +82,25 @@ def init_database(config: "Config") -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_review (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                caption TEXT,
+                width INTEGER,
+                height INTEGER,
+                quality TEXT,
+                reason TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
 
 
 def save_setting(config: "Config", key: str, value: object) -> None:
@@ -160,6 +179,65 @@ def register_published(config: "Config", data: dict, caption: str) -> None:
                 data.get("file_id"),
                 int(time.time()),
             ),
+        )
+
+
+def save_pending_review(config: "Config", user_id: int, video_info: dict, caption: str, quality: str | None, reason: str) -> int:
+    now = int(time.time())
+    with sqlite3.connect(config.database_path) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO pending_review (
+                user_id, kind, file_id, file_name, caption, width, height,
+                quality, reason, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+            """,
+            (
+                user_id,
+                video_info.get("kind"),
+                video_info.get("file_id"),
+                video_info.get("file_name"),
+                caption,
+                video_info.get("width"),
+                video_info.get("height"),
+                quality,
+                reason,
+                now,
+                now,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+
+def pending_review_count(config: "Config", user_id: int) -> int:
+    with sqlite3.connect(config.database_path) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM pending_review WHERE user_id = ? AND status = 'pending'",
+            (user_id,),
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def get_next_pending_review(config: "Config", user_id: int) -> dict | None:
+    with sqlite3.connect(config.database_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            """
+            SELECT * FROM pending_review
+            WHERE user_id = ? AND status = 'pending'
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (user_id,),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_pending_review_done(config: "Config", pending_id: int) -> None:
+    with sqlite3.connect(config.database_path) as conn:
+        conn.execute(
+            "UPDATE pending_review SET status = 'done', updated_at = ? WHERE id = ?",
+            (int(time.time()), pending_id),
         )
 
 
@@ -475,6 +553,16 @@ def format_season(value: str | int | None) -> str | None:
     return None
 
 
+def video_info_from_pending(row: dict) -> dict:
+    return {
+        "kind": row["kind"],
+        "file_id": row["file_id"],
+        "file_name": row["file_name"],
+        "width": row.get("width"),
+        "height": row.get("height"),
+    }
+
+
 def format_episode(value: str | int | None) -> str | None:
     if value is None:
         return None
@@ -646,6 +734,12 @@ async def handle_detected_media(
     missing = required_fields_missing(merged_data)
     if missing:
         logging.info("Detected partial metadata, missing fields: %s", ", ".join(missing))
+        if config.llm_auto_post:
+            pending_id = save_pending_review(config, user_id, video_info, message.caption or "", merged_data.get("quality"), f"missing: {', '.join(missing)}")
+            logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
+            await state.clear()
+            await after_file_processed(user_id, state, bot, config)
+            return True
         if await ask_missing_required_fields(message, state, merged_data, missing):
             return True
         return False
@@ -977,6 +1071,8 @@ async def help_command(message: Message, config: Config) -> None:
         "/setchannel -1001234567890 o @canal - Cambiar canal destino hasta reiniciar\n"
         "/speed safe|normal|fast - Cambiar velocidad de cola\n"
         "/queue - Ver videos pendientes en cola\n"
+        "/pending - Ver cuántos archivos requieren revisión\n"
+        "/review - Revisar el siguiente archivo pendiente\n"
         "/clearqueue - Vaciar cola pendiente\n"
         "/cancel - Cancelar archivo actual y pasar al siguiente",
     )
@@ -1003,7 +1099,8 @@ async def config_command(message: Message, config: Config) -> None:
         f"SQLite: <code>{config.database_path}</code>\n"
         f"Usuarios permitidos: {'todos' if not config.allowed_user_ids else len(config.allowed_user_ids)}\n"
         f"Procesando ahora: {processing}\n"
-        f"Pendientes en cola: {queue_len}",
+        f"Pendientes en cola: {queue_len}\n"
+        f"Pendientes de revisión: {pending_review_count(config, user_id)}",
     )
 
 
@@ -1106,6 +1203,35 @@ async def clearqueue_command(message: Message, config: Config) -> None:
     await safe_answer(message, f"Cola vaciada. Videos removidos: {removed}.")
 
 
+async def pending_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    count = pending_review_count(config, message.from_user.id)
+    await safe_answer(message, f"Archivos pendientes de revisión: {count}." + (" Usa /review para revisar el siguiente." if count else ""))
+
+
+async def review_command(message: Message, state: FSMContext, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    row = get_next_pending_review(config, message.from_user.id)
+    if not row:
+        await safe_answer(message, "No hay archivos pendientes de revisión.")
+        return
+
+    video_info = video_info_from_pending(row)
+    await state.clear()
+    await state.update_data(**video_info, quality=row.get("quality"), pending_review_id=row["id"])
+    await state.set_state(MediaForm.choosing_type)
+    await safe_answer(
+        message,
+        f"Revisando pendiente #{row['id']}\n"
+        f"Archivo actual: <code>{row['file_name']}</code>\n"
+        f"Motivo: {row.get('reason') or 'requiere asistencia'}\n\n"
+        "¿Es película o serie?",
+        reply_markup=type_keyboard(),
+    )
+
+
 def detected_quality_keyboard(quality: str | None, prefix: str) -> InlineKeyboardMarkup | None:
     if not quality:
         return None
@@ -1129,7 +1255,11 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     if not queue:
         user_processing[user_id] = False
         processed = user_processed_counts.pop(user_id, 0)
-        await safe_send_message(bot, user_id, f"✅ Cola terminada. Archivos procesados: {processed}.", config=config)
+        pending = pending_review_count(config, user_id)
+        message = f"✅ Cola terminada. Archivos procesados: {processed}."
+        if pending:
+            message += f"\n⚠️ Pendientes para revisar: {pending}. Usa /review para revisarlos uno por uno."
+        await safe_send_message(bot, user_id, message, config=config)
         return
 
     user_processing[user_id] = True
@@ -1185,6 +1315,12 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             missing = required_fields_missing(merged_data)
             if missing:
                 logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
+                if config.llm_auto_post:
+                    pending_id = save_pending_review(config, user_id, video_info, caption_text, merged_data.get("quality"), f"missing: {', '.join(missing)}")
+                    logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
+                    await state.clear()
+                    await after_file_processed(user_id, state, bot, config)
+                    return
                 if await ask_missing_required_fields(message, state, merged_data, missing):
                     return
 
@@ -1231,6 +1367,13 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 text = f"Encontré esto en TMDB:\n\n<b>{title}</b> ({year}) - {kind}\n\n¿Es correcto?"
                 await safe_answer(message, text, reply_markup=tmdb_confirm_keyboard())
                 return
+
+    if config.llm_auto_post:
+        pending_id = save_pending_review(config, user_id, video_info, caption_text, quality, "insufficient metadata")
+        logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
+        await state.clear()
+        await after_file_processed(user_id, state, bot, config)
+        return
 
     await state.set_state(MediaForm.choosing_type)
     quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
@@ -1512,6 +1655,9 @@ async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: 
 
     await callback.answer("Enviado" if published else "Duplicado")
     await safe_answer(callback.message, "✅ Archivo enviado al canal." if published else "⏭️ Duplicado omitido; ya estaba publicado.", config=config)
+    pending_id = data.get("pending_review_id")
+    if pending_id:
+        mark_pending_review_done(config, int(pending_id))
     await after_file_processed(callback.from_user.id, state, bot, config)
 
 
@@ -1555,6 +1701,12 @@ async def main() -> None:
     async def clearqueue_handler(message: Message) -> None:
         await clearqueue_command(message, config)
 
+    async def pending_handler(message: Message) -> None:
+        await pending_command(message, config)
+
+    async def review_handler(message: Message, state: FSMContext) -> None:
+        await review_command(message, state, config)
+
     async def cancel_handler(message: Message, state: FSMContext) -> None:
         await cancel(message, state, bot, config)
 
@@ -1595,6 +1747,8 @@ async def main() -> None:
     dp.message.register(setchannel_handler, Command("setchannel"), private_chat)
     dp.message.register(speed_handler, Command("speed"), private_chat)
     dp.message.register(queue_handler, Command("queue"), private_chat)
+    dp.message.register(pending_handler, Command("pending"), private_chat)
+    dp.message.register(review_handler, Command("review"), private_chat)
     dp.message.register(clearqueue_handler, Command("clearqueue"), private_chat)
     dp.message.register(cancel_handler, F.text.casefold() == "/cancel", private_chat)
     dp.message.register(receive_video_handler, (F.video | F.document), private_chat)

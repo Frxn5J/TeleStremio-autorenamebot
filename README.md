@@ -86,6 +86,8 @@ Estos comandos solo funcionan en chat privado con el bot:
 /setchannel -1001234567890 - Cambiar canal destino y guardarlo en SQLite
 /speed safe|normal|fast - Cambiar velocidad de procesamiento
 /queue - Ver videos pendientes en cola
+/pending - Ver archivos que requieren revisión manual
+/review - Revisar el siguiente archivo pendiente
 /clearqueue - Vaciar cola pendiente
 /cancel - Cancelar archivo actual y pasar al siguiente
 ```
