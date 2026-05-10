@@ -12,7 +12,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -97,7 +97,7 @@ class MediaForm(StatesGroup):
     confirming = State()
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
     bot_token: str
     target_channel_id: int | str
@@ -577,6 +577,33 @@ def is_allowed(config: Config, user_id: int | None) -> bool:
     return bool(user_id) and (not config.allowed_user_ids or user_id in config.allowed_user_ids)
 
 
+def parse_bool_arg(value: str) -> bool | None:
+    normalized = value.strip().lower()
+    if normalized in {"on", "true", "1", "yes", "si", "sí", "activar", "enable"}:
+        return True
+    if normalized in {"off", "false", "0", "no", "desactivar", "disable"}:
+        return False
+    return None
+
+
+def parse_target_channel(value: str) -> int | str | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        if value.startswith("@"):
+            return value
+    return None
+
+
+def command_args(message: Message) -> str:
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 async def reject_if_not_allowed(message: Message, config: Config) -> bool:
     if is_allowed(config, message.from_user.id if message.from_user else None):
         return False
@@ -594,6 +621,108 @@ async def start(message: Message, state: FSMContext, config: Config) -> None:
         "Puedes enviarme varios a la vez y los procesaré uno por uno en cola.\n"
         "No guardo archivos en disco; Telegram lo copia directo al canal."
     )
+
+
+async def help_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    await safe_answer(
+        message,
+        "Comandos disponibles:\n"
+        "/config - Ver configuración actual\n"
+        "/autopost on|off - Activar/desactivar auto-publicación\n"
+        "/debug on|off - Activar/desactivar logs del LLM\n"
+        "/setchannel -1001234567890 o @canal - Cambiar canal destino hasta reiniciar\n"
+        "/queue - Ver videos pendientes en cola\n"
+        "/clearqueue - Vaciar cola pendiente\n"
+        "/cancel - Cancelar archivo actual y pasar al siguiente",
+    )
+
+
+async def config_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id
+    queue_len = len(user_queues.get(user_id, []))
+    processing = "sí" if user_processing.get(user_id, False) else "no"
+    await safe_answer(
+        message,
+        "Configuración actual:\n"
+        f"Canal destino: <code>{config.target_channel_id}</code>\n"
+        f"Auto-post: {'on' if config.llm_auto_post else 'off'}\n"
+        f"LLM debug: {'on' if config.llm_debug else 'off'}\n"
+        f"LLM configurado: {'sí' if config.llm_api_key and config.llm_model else 'no'}\n"
+        f"TMDB configurado: {'sí' if config.tmdb_api_key else 'no'}\n"
+        f"Usuarios permitidos: {'todos' if not config.allowed_user_ids else len(config.allowed_user_ids)}\n"
+        f"Procesando ahora: {processing}\n"
+        f"Pendientes en cola: {queue_len}",
+    )
+
+
+async def autopost_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    args = command_args(message)
+    if not args:
+        await safe_answer(message, f"Auto-post está {'on' if config.llm_auto_post else 'off'}. Usa /autopost on o /autopost off.")
+        return
+    value = parse_bool_arg(args)
+    if value is None:
+        await safe_answer(message, "Valor inválido. Usa /autopost on o /autopost off.")
+        return
+    config.llm_auto_post = value
+    await safe_answer(message, f"Auto-post cambiado a {'on' if value else 'off'}.")
+
+
+async def debug_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    args = command_args(message)
+    if not args:
+        await safe_answer(message, f"LLM debug está {'on' if config.llm_debug else 'off'}. Usa /debug on o /debug off.")
+        return
+    value = parse_bool_arg(args)
+    if value is None:
+        await safe_answer(message, "Valor inválido. Usa /debug on o /debug off.")
+        return
+    config.llm_debug = value
+    await safe_answer(message, f"LLM debug cambiado a {'on' if value else 'off'}.")
+
+
+async def setchannel_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    target = parse_target_channel(command_args(message))
+    if target is None:
+        await safe_answer(message, "Uso: /setchannel -1001234567890 o /setchannel @nombre_del_canal")
+        return
+    config.target_channel_id = target
+    await safe_answer(message, f"Canal destino cambiado a <code>{target}</code>. Este cambio dura hasta reiniciar el bot.")
+
+
+async def queue_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id
+    queue = user_queues.get(user_id, [])
+    if not queue:
+        await safe_answer(message, "No hay videos pendientes en cola.")
+        return
+    names = []
+    for index, queued_message in enumerate(queue[:10], start=1):
+        info = get_video_info(queued_message)
+        names.append(f"{index}. {info['file_name'] if info else 'archivo no válido'}")
+    extra = "" if len(queue) <= 10 else f"\n...y {len(queue) - 10} más."
+    await safe_answer(message, "Videos pendientes:\n" + "\n".join(names) + extra)
+
+
+async def clearqueue_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    user_id = message.from_user.id
+    removed = len(user_queues.get(user_id, []))
+    user_queues[user_id] = []
+    await safe_answer(message, f"Cola vaciada. Videos removidos: {removed}.")
 
 
 def detected_quality_keyboard(quality: str | None, prefix: str) -> InlineKeyboardMarkup | None:
@@ -1046,6 +1175,27 @@ async def main() -> None:
     async def start_handler(message: Message, state: FSMContext) -> None:
         await start(message, state, config)
 
+    async def help_handler(message: Message) -> None:
+        await help_command(message, config)
+
+    async def config_handler(message: Message) -> None:
+        await config_command(message, config)
+
+    async def autopost_handler(message: Message) -> None:
+        await autopost_command(message, config)
+
+    async def debug_handler(message: Message) -> None:
+        await debug_command(message, config)
+
+    async def setchannel_handler(message: Message) -> None:
+        await setchannel_command(message, config)
+
+    async def queue_handler(message: Message) -> None:
+        await queue_command(message, config)
+
+    async def clearqueue_handler(message: Message) -> None:
+        await clearqueue_command(message, config)
+
     async def cancel_handler(message: Message, state: FSMContext) -> None:
         await cancel(message, state, bot, config)
 
@@ -1079,6 +1229,13 @@ async def main() -> None:
     private_chat = F.chat.type == "private"
 
     dp.message.register(start_handler, CommandStart(), private_chat)
+    dp.message.register(help_handler, Command("help"), private_chat)
+    dp.message.register(config_handler, Command("config"), private_chat)
+    dp.message.register(autopost_handler, Command("autopost"), private_chat)
+    dp.message.register(debug_handler, Command("debug"), private_chat)
+    dp.message.register(setchannel_handler, Command("setchannel"), private_chat)
+    dp.message.register(queue_handler, Command("queue"), private_chat)
+    dp.message.register(clearqueue_handler, Command("clearqueue"), private_chat)
     dp.message.register(cancel_handler, F.text.casefold() == "/cancel", private_chat)
     dp.message.register(receive_video_handler, (F.video | F.document), private_chat)
     dp.callback_query.register(llm_confirm_handler, F.data.startswith("llm:"), MediaForm.confirming_llm)

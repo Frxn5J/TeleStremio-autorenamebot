@@ -56,6 +56,23 @@ LLM_DEBUG=false
 4. Completa los campos solicitados.
 5. Revisa la vista previa y pulsa `Enviar al canal`.
 
+## Comandos
+
+Estos comandos solo funcionan en chat privado con el bot:
+
+```text
+/help - Ver ayuda de comandos
+/config - Ver configuración actual
+/autopost on|off - Activar/desactivar auto-publicación
+/debug on|off - Activar/desactivar logs del LLM
+/setchannel -1001234567890 - Cambiar canal destino hasta reiniciar
+/queue - Ver videos pendientes en cola
+/clearqueue - Vaciar cola pendiente
+/cancel - Cancelar archivo actual y pasar al siguiente
+```
+
+Las API keys se configuran por variables de entorno en Coolify; no se cambian por Telegram para evitar exponer secretos.
+
 ## Formatos generados
 
 Película:
