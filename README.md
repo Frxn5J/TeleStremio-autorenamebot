@@ -29,6 +29,7 @@ TELEGRAM_MIN_INTERVAL=1.2
 TELEGRAM_FILE_INTERVAL=2.0
 TELEGRAM_MAX_RETRIES=8
 QUEUE_NOTIFY_EVERY=25
+DATABASE_PATH=/app/data/bot.sqlite3
 ```
 
 `BOT_TOKEN`: token de BotFather.
@@ -54,6 +55,8 @@ QUEUE_NOTIFY_EVERY=25
 `TELEGRAM_MAX_RETRIES`: reintentos máximos si Telegram responde con timeout o flood control.
 
 `QUEUE_NOTIFY_EVERY`: cada cuántos archivos pendientes avisa el bot en cargas masivas.
+
+`DATABASE_PATH`: ruta del archivo SQLite persistente. En Coolify monta un volumen en `/app/data` para conservar la base entre redeploys.
 
 ## Despliegue rápido en Coolify
 

@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import re
+import sqlite3
+import time
 import urllib.parse
 from dataclasses import dataclass
 from typing import Literal
@@ -45,6 +47,80 @@ def env_int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)).strip())
     except ValueError:
         return default
+
+
+def init_database(config: "Config") -> None:
+    parent = os.path.dirname(config.database_path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with sqlite3.connect(config.database_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS published_media (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                caption TEXT NOT NULL,
+                media_type TEXT,
+                name TEXT,
+                year TEXT,
+                season TEXT,
+                episode TEXT,
+                quality TEXT,
+                optional TEXT,
+                file_name TEXT,
+                file_id TEXT,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+
+def dedupe_key(caption: str) -> str:
+    return re.sub(r"\s+", " ", caption.strip().lower())
+
+
+def already_published(config: "Config", caption: str) -> bool:
+    with sqlite3.connect(config.database_path) as conn:
+        row = conn.execute(
+            "SELECT 1 FROM published_media WHERE dedupe_key = ? LIMIT 1",
+            (dedupe_key(caption),),
+        ).fetchone()
+    return row is not None
+
+
+def register_published(config: "Config", data: dict, caption: str) -> None:
+    with sqlite3.connect(config.database_path) as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO published_media (
+                dedupe_key, caption, media_type, name, year, season, episode,
+                quality, optional, file_name, file_id, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                dedupe_key(caption),
+                caption,
+                data.get("media_type"),
+                data.get("name"),
+                data.get("year"),
+                data.get("season"),
+                data.get("episode"),
+                data.get("quality"),
+                data.get("optional"),
+                data.get("file_name"),
+                data.get("file_id"),
+                int(time.time()),
+            ),
+        )
+
+
+async def publish_media(bot: Bot, config: "Config", data: dict, caption: str) -> bool:
+    if already_published(config, caption):
+        logging.info("Duplicate skipped: %s", caption)
+        return False
+    await safe_send_media(bot, config.target_channel_id, data, caption, config=config)
+    register_published(config, data, caption)
+    return True
 
 
 async def telegram_rate_limit(config: "Config") -> None:
@@ -169,6 +245,7 @@ class Config:
     telegram_file_interval: float
     telegram_max_retries: int
     queue_notify_every: int
+    database_path: str
 
 
 def load_config() -> Config:
@@ -184,6 +261,7 @@ def load_config() -> Config:
     telegram_file_interval = env_float("TELEGRAM_FILE_INTERVAL", 2.0)
     telegram_max_retries = env_int("TELEGRAM_MAX_RETRIES", 8)
     queue_notify_every = env_int("QUEUE_NOTIFY_EVERY", 25)
+    database_path = os.getenv("DATABASE_PATH", "/app/data/bot.sqlite3").strip()
 
     if not token:
         raise RuntimeError("Falta BOT_TOKEN en las variables de entorno.")
@@ -212,6 +290,7 @@ def load_config() -> Config:
         telegram_file_interval=telegram_file_interval,
         telegram_max_retries=telegram_max_retries,
         queue_notify_every=queue_notify_every,
+        database_path=database_path,
     )
 
 
@@ -435,6 +514,34 @@ def required_fields_missing(data: dict) -> list[str]:
     return ["media_type"]
 
 
+async def ask_missing_required_fields(message: Message, state: FSMContext, data: dict, missing: list[str]) -> bool:
+    if data.get("media_type") == "movie":
+        if "year" in missing:
+            await state.set_state(MediaForm.movie_year)
+            await safe_answer(message, current_file_label(data) + f"Película detectada: <b>{data.get('name', '')}</b>\n\nAño de estreno. Ejemplo: 2023")
+            return True
+        if "quality" in missing:
+            await state.set_state(MediaForm.movie_quality)
+            await ask_movie_quality(message, state)
+            return True
+
+    if data.get("media_type") == "series":
+        if "season" in missing:
+            await state.set_state(MediaForm.series_season)
+            await safe_answer(message, current_file_label(data) + "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
+            return True
+        if "episode" in missing:
+            await state.set_state(MediaForm.series_episode)
+            await safe_answer(message, current_file_label(data) + "Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
+            return True
+        if "quality" in missing:
+            await state.set_state(MediaForm.series_quality)
+            await ask_series_quality(message, state)
+            return True
+
+    return False
+
+
 async def handle_detected_media(
     user_id: int,
     message: Message,
@@ -449,13 +556,7 @@ async def handle_detected_media(
     missing = required_fields_missing(merged_data)
     if missing:
         logging.info("Detected partial metadata, missing fields: %s", ", ".join(missing))
-        if merged_data.get("media_type") == "series" and missing == ["quality"]:
-            await state.set_state(MediaForm.series_quality)
-            await ask_series_quality(message, state)
-            return True
-        if merged_data.get("media_type") == "movie" and missing == ["quality"]:
-            await state.set_state(MediaForm.movie_quality)
-            await ask_movie_quality(message, state)
+        if await ask_missing_required_fields(message, state, merged_data, missing):
             return True
         return False
 
@@ -468,7 +569,9 @@ async def handle_detected_media(
     await state.update_data(caption=caption)
     if config.llm_auto_post:
         try:
-            await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
+            published = await publish_media(bot, config, merged_data, caption)
+            if not published:
+                await safe_answer(message, f"⏭️ Duplicado omitido: <code>{caption}</code>", config=config)
             await state.clear()
             await after_file_processed(user_id, state, bot, config)
             return True
@@ -717,6 +820,11 @@ def build_caption(data: dict) -> str:
     return f"{'.'.join(parts)}{ext}"
 
 
+def current_file_label(data: dict) -> str:
+    file_name = data.get("file_name") or "archivo actual"
+    return f"Archivo actual: <code>{file_name}</code>\n"
+
+
 def is_allowed(config: Config, user_id: int | None) -> bool:
     return bool(user_id) and (not config.allowed_user_ids or user_id in config.allowed_user_ids)
 
@@ -802,6 +910,7 @@ async def config_command(message: Message, config: Config) -> None:
         f"Pausa por archivo: {config.telegram_file_interval}s\n"
         f"Reintentos Telegram: {config.telegram_max_retries}\n"
         f"Aviso de cola cada: {config.queue_notify_every}\n"
+        f"SQLite: <code>{config.database_path}</code>\n"
         f"Usuarios permitidos: {'todos' if not config.allowed_user_ids else len(config.allowed_user_ids)}\n"
         f"Procesando ahora: {processing}\n"
         f"Pendientes en cola: {queue_len}",
@@ -979,13 +1088,7 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             missing = required_fields_missing(merged_data)
             if missing:
                 logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
-                if merged_data.get("media_type") == "series" and missing == ["quality"]:
-                    await state.set_state(MediaForm.series_quality)
-                    await ask_series_quality(message, state)
-                    return
-                if merged_data.get("media_type") == "movie" and missing == ["quality"]:
-                    await state.set_state(MediaForm.movie_quality)
-                    await ask_movie_quality(message, state)
+                if await ask_missing_required_fields(message, state, merged_data, missing):
                     return
 
             try:
@@ -994,7 +1097,9 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 
                 if config.llm_auto_post:
                     try:
-                        await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
+                        published = await publish_media(bot, config, merged_data, caption)
+                        if not published:
+                            await safe_answer(message, f"⏭️ Duplicado omitido: <code>{caption}</code>", config=config)
                         
                         await state.clear()
                         await after_file_processed(user_id, state, bot, config)
@@ -1065,10 +1170,10 @@ async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bo
         await callback.answer()
         data = await state.get_data()
         try:
-            await safe_send_media(bot, config.target_channel_id, data, data["caption"], config=config)
+            published = await publish_media(bot, config, data, data["caption"])
             
             await state.clear()
-            await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente.", config=config)
+            await safe_answer(callback.message, "✅ Archivo enviado al canal correctamente." if published else "⏭️ Duplicado omitido; ya estaba publicado.", config=config)
         except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
             await safe_answer(callback.message, f"Error enviando al canal: {exc}", config=config)
             
@@ -1131,32 +1236,36 @@ async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_name)
-        await safe_answer(callback.message, "Título de la película. Ejemplo: Ghosted")
+        data = await state.get_data()
+        await safe_answer(callback.message, current_file_label(data) + "Título de la película. Ejemplo: Ghosted")
         return
 
     await state.set_state(MediaForm.series_name)
-    await safe_answer(callback.message, "Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
+    data = await state.get_data()
+    await safe_answer(callback.message, current_file_label(data) + "Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
 
 
 async def movie_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=clean_text(message.text or ""))
     await state.set_state(MediaForm.movie_year)
-    await safe_answer(message, "Año de estreno. Ejemplo: 2023")
+    data = await state.get_data()
+    await safe_answer(message, current_file_label(data) + "Año de estreno. Ejemplo: 2023")
 
 
 async def ask_movie_quality(message: Message, state: FSMContext, prefix: str = "") -> None:
     data = await state.get_data()
     detected = data.get("quality")
-    text = f"{prefix}Calidad o resolución. Ejemplo: 1080p"
+    text = current_file_label(data) + f"{prefix}Calidad o resolución. Ejemplo: 1080p"
     if detected:
         text += f"\nDetectada: {detected}. Puedes tocar el botón o escribir otra."
     await safe_answer(message, text, reply_markup=detected_quality_keyboard(detected, "movie_quality"))
 
 
-async def ask_movie_optional(message: Message) -> None:
+async def ask_movie_optional(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
     await safe_answer(
         message,
-        "Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay extras, toca el botón.",
+        current_file_label(data) + "Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay extras, toca el botón.",
         reply_markup=optional_keyboard("movie_optional"),
     )
 
@@ -1174,7 +1283,7 @@ async def movie_year(message: Message, state: FSMContext) -> None:
 async def movie_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.movie_optional)
-    await ask_movie_optional(message)
+    await ask_movie_optional(message, state)
 
 
 async def movie_optional(message: Message, state: FSMContext) -> None:
@@ -1185,22 +1294,24 @@ async def movie_optional(message: Message, state: FSMContext) -> None:
 async def series_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=clean_text(message.text or ""))
     await state.set_state(MediaForm.series_season)
-    await safe_answer(message, "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
+    data = await state.get_data()
+    await safe_answer(message, current_file_label(data) + "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
 
 
 async def ask_series_quality(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     detected = data.get("quality")
-    text = "Calidad o resolución. Ejemplo: 1080p"
+    text = current_file_label(data) + "Calidad o resolución. Ejemplo: 1080p"
     if detected:
         text += f"\nDetectada: {detected}. Puedes tocar el botón o escribir otra."
     await safe_answer(message, text, reply_markup=detected_quality_keyboard(detected, "series_quality"))
 
 
-async def ask_series_optional(message: Message) -> None:
+async def ask_series_optional(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
     await safe_answer(
         message,
-        "Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay extras, toca el botón.",
+        current_file_label(data) + "Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay extras, toca el botón.",
         reply_markup=optional_keyboard("series_optional"),
     )
 
@@ -1212,7 +1323,8 @@ async def series_season(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(season=season)
     await state.set_state(MediaForm.series_episode)
-    await safe_answer(message, "Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
+    data = await state.get_data()
+    await safe_answer(message, current_file_label(data) + "Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
 
 
 async def series_episode(message: Message, state: FSMContext) -> None:
@@ -1228,7 +1340,7 @@ async def series_episode(message: Message, state: FSMContext) -> None:
 async def series_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.series_optional)
-    await ask_series_optional(message)
+    await ask_series_optional(message, state)
 
 
 async def series_optional(message: Message, state: FSMContext) -> None:
@@ -1245,7 +1357,7 @@ async def handle_movie_quality_callback(callback: CallbackQuery, state: FSMConte
     await callback.answer()
     await state.update_data(quality=quality)
     await state.set_state(MediaForm.movie_optional)
-    await ask_movie_optional(callback.message)
+    await ask_movie_optional(callback.message, state)
 
 
 async def handle_series_quality_callback(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1257,7 +1369,7 @@ async def handle_series_quality_callback(callback: CallbackQuery, state: FSMCont
     await callback.answer()
     await state.update_data(quality=quality)
     await state.set_state(MediaForm.series_optional)
-    await ask_series_optional(callback.message)
+    await ask_series_optional(callback.message, state)
 
 
 async def handle_movie_optional_callback(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1294,15 +1406,15 @@ async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: 
 
     data = await state.get_data()
     try:
-        await safe_send_media(bot, config.target_channel_id, data, data["caption"], config=config)
+        published = await publish_media(bot, config, data, data["caption"])
     except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
         await callback.answer("No se pudo enviar", show_alert=True)
         await safe_answer(callback.message, f"Error enviando al canal: {exc}", config=config)
         await after_file_processed(callback.from_user.id, state, bot, config)
         return
 
-    await callback.answer("Enviado")
-    await safe_answer(callback.message, "✅ Archivo enviado al canal.", config=config)
+    await callback.answer("Enviado" if published else "Duplicado")
+    await safe_answer(callback.message, "✅ Archivo enviado al canal." if published else "⏭️ Duplicado omitido; ya estaba publicado.", config=config)
     await after_file_processed(callback.from_user.id, state, bot, config)
 
 
@@ -1314,6 +1426,7 @@ async def cancel(message: Message, state: FSMContext, bot: Bot, config: Config) 
 async def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
     config = load_config()
+    init_database(config)
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
