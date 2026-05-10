@@ -223,6 +223,8 @@ def clean_filename_for_search(file_name: str) -> str:
 
 def extract_llm_content(response: object) -> str:
     if isinstance(response, str):
+        if "data:" in response and "chat.completion.chunk" in response:
+            return extract_sse_content(response)
         return response
 
     if isinstance(response, dict):
@@ -245,10 +247,38 @@ def extract_llm_content(response: object) -> str:
     return str(response)
 
 
+def extract_sse_content(text: str) -> str:
+    parts: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+
+        payload = line.removeprefix("data:").strip()
+        if not payload or payload == "[DONE]":
+            continue
+
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+
+        for choice in chunk.get("choices", []):
+            delta = choice.get("delta") or {}
+            message = choice.get("message") or {}
+            content = delta.get("content") or message.get("content")
+            if content:
+                parts.append(content)
+
+    return "".join(parts) if parts else text
+
+
 def extract_json_object(text: str) -> dict:
     content = text.strip()
     if content.startswith("```"):
         content = content.strip("` \n")
+    if content.endswith("```"):
+        content = content[:-3].strip()
     if content.lower().startswith("json"):
         content = content[4:].strip()
 
