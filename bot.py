@@ -672,12 +672,33 @@ async def main() -> None:
     bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
 
-    dp.message.register(lambda message, state: start(message, state, config), CommandStart())
-    dp.message.register(lambda message, state: cancel(message, state, bot, config), F.text.casefold() == "/cancel")
-    dp.message.register(lambda message, state: receive_video(message, state, bot, config), F.video | F.document)
-    dp.callback_query.register(lambda callback, state: handle_llm_confirm(callback, state, bot, config), F.data.startswith("llm:"), MediaForm.confirming_llm)
-    dp.callback_query.register(lambda callback, state: handle_tmdb_confirm(callback, state, config), F.data.startswith("tmdb:"), MediaForm.confirming_tmdb)
-    dp.callback_query.register(lambda callback, state: choose_type(callback, state, config), F.data.startswith("type:"), MediaForm.choosing_type)
+    async def start_handler(message: Message, state: FSMContext) -> None:
+        await start(message, state, config)
+
+    async def cancel_handler(message: Message, state: FSMContext) -> None:
+        await cancel(message, state, bot, config)
+
+    async def receive_video_handler(message: Message, state: FSMContext) -> None:
+        await receive_video(message, state, bot, config)
+
+    async def llm_confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_llm_confirm(callback, state, bot, config)
+
+    async def tmdb_confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_tmdb_confirm(callback, state, config)
+
+    async def choose_type_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await choose_type(callback, state, config)
+
+    async def confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await confirm(callback, state, bot, config)
+
+    dp.message.register(start_handler, CommandStart())
+    dp.message.register(cancel_handler, F.text.casefold() == "/cancel")
+    dp.message.register(receive_video_handler, F.video | F.document)
+    dp.callback_query.register(llm_confirm_handler, F.data.startswith("llm:"), MediaForm.confirming_llm)
+    dp.callback_query.register(tmdb_confirm_handler, F.data.startswith("tmdb:"), MediaForm.confirming_tmdb)
+    dp.callback_query.register(choose_type_handler, F.data.startswith("type:"), MediaForm.choosing_type)
     dp.message.register(movie_name, MediaForm.movie_name)
     dp.message.register(movie_year, MediaForm.movie_year)
     dp.message.register(movie_quality, MediaForm.movie_quality)
@@ -687,7 +708,7 @@ async def main() -> None:
     dp.message.register(series_episode, MediaForm.series_episode)
     dp.message.register(series_quality, MediaForm.series_quality)
     dp.message.register(series_optional, MediaForm.series_optional)
-    dp.callback_query.register(lambda callback, state: confirm(callback, state, bot, config), F.data.startswith("confirm:"), MediaForm.confirming)
+    dp.callback_query.register(confirm_handler, F.data.startswith("confirm:"), MediaForm.confirming)
 
     await dp.start_polling(bot)
 
