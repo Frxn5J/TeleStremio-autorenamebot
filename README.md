@@ -24,6 +24,7 @@ LLM_BASE_URL=https://api.tu-proveedor.com/v1
 LLM_MODEL=nombre-del-modelo
 LLM_AUTO_POST=false
 LLM_DEBUG=false
+LLM_TIMEOUT=15
 TELEGRAM_MIN_INTERVAL=1.2
 TELEGRAM_FILE_INTERVAL=2.0
 TELEGRAM_MAX_RETRIES=8
@@ -43,6 +44,8 @@ QUEUE_NOTIFY_EVERY=25
 `LLM_AUTO_POST`: opcional (`true` o `false`). Si está en `true` y el LLM logra extraer los datos correctamente, el bot publicará el video en el canal inmediatamente sin pedirte confirmación y pasará al siguiente video de la cola. Ideal para envíos masivos.
 
 `LLM_DEBUG`: opcional (`true` o `false`). Si está en `true`, el bot mostrará en los logs el prompt enviado al LLM, la respuesta cruda y el JSON parseado. Úsalo solo para depurar porque puede mostrar nombres de archivos o textos privados.
+
+`LLM_TIMEOUT`: segundos máximos para esperar una respuesta del LLM antes de usar detección local/TMDB/manual.
 
 `TELEGRAM_MIN_INTERVAL`: segundos mínimos entre envíos a Telegram. Sube este valor para colas muy grandes.
 

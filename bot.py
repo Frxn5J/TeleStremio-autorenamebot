@@ -376,15 +376,42 @@ def local_parse_series(text: str) -> dict | None:
     }
 
 
-def normalize_llm_data(data: dict, fallback_quality: str | None, combined_text: str) -> dict:
+def local_parse_movie(text: str) -> dict | None:
+    normalized = normalize_metadata_text(text)
+    match = re.search(r"(?P<title>.*?)(?:\s+[\(\[-]?)(?P<year>(?:19|20)\d{2})(?:[\)\]-]?)(?P<rest>.*)$", normalized)
+    if not match:
+        return None
+
+    title = clean_detected_name(match.group("title"))
+    year = match.group("year")
+    optional = clean_detected_name(match.group("rest") or "")
+    if not title or not year:
+        return None
+    return {
+        "media_type": "movie",
+        "name": title,
+        "year": year,
+        "optional": optional,
+    }
+
+
+def local_parse_media(text: str) -> dict | None:
+    return local_parse_series(text) or local_parse_movie(text)
+
+
+def local_parse_from_sources(file_name: str, caption: str) -> dict | None:
+    return local_parse_media(file_name) or local_parse_media(caption) or local_parse_media(f"{file_name} {caption}")
+
+
+def normalize_llm_data(data: dict, fallback_quality: str | None, file_name: str, caption: str) -> dict:
     result = dict(data)
-    local_series = local_parse_series(combined_text)
-    if local_series and result.get("media_type") == "series":
-        for key in ("name", "season", "episode"):
-            if not result.get(key):
-                result[key] = local_series.get(key)
+    local_data = local_parse_from_sources(file_name, caption)
+    if local_data and result.get("media_type") == local_data.get("media_type"):
+        for key in ("name", "year", "season", "episode"):
+            if not result.get(key) and local_data.get(key):
+                result[key] = local_data.get(key)
         if not result.get("optional"):
-            result["optional"] = local_series.get("optional", "")
+            result["optional"] = local_data.get("optional", "")
 
     if result.get("media_type") == "series":
         result["season"] = format_season(result.get("season")) or result.get("season")
@@ -406,6 +433,51 @@ def required_fields_missing(data: dict) -> list[str]:
     if data.get("media_type") == "series":
         return [key for key in ("name", "season", "episode", "quality") if not data.get(key)]
     return ["media_type"]
+
+
+async def handle_detected_media(
+    user_id: int,
+    message: Message,
+    state: FSMContext,
+    bot: Bot,
+    config: Config,
+    video_info: dict,
+    detected_data: dict,
+) -> bool:
+    await state.update_data(**detected_data)
+    merged_data = {**(await state.get_data()), **detected_data}
+    missing = required_fields_missing(merged_data)
+    if missing:
+        logging.info("Detected partial metadata, missing fields: %s", ", ".join(missing))
+        if merged_data.get("media_type") == "series" and missing == ["quality"]:
+            await state.set_state(MediaForm.series_quality)
+            await ask_series_quality(message, state)
+            return True
+        if merged_data.get("media_type") == "movie" and missing == ["quality"]:
+            await state.set_state(MediaForm.movie_quality)
+            await ask_movie_quality(message, state)
+            return True
+        return False
+
+    try:
+        caption = build_caption(merged_data)
+    except KeyError as exc:
+        logging.error("Detected metadata missing key for build_caption: %s", exc)
+        return False
+
+    await state.update_data(caption=caption)
+    if config.llm_auto_post:
+        try:
+            await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
+            await state.clear()
+            await after_file_processed(user_id, state, bot, config)
+            return True
+        except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
+            await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
+
+    await state.set_state(MediaForm.confirming_llm)
+    await safe_answer(message, f"Detección automática:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?", reply_markup=llm_confirm_keyboard())
+    return True
 
 
 def extract_llm_content(response: object) -> str:
@@ -505,9 +577,12 @@ async def parse_filename_with_llm(filename: str, caption: str, local_quality: st
     if not config.llm_api_key or not config.llm_model:
         return None
 
+    timeout = env_float("LLM_TIMEOUT", 15.0)
     client = AsyncOpenAI(
         api_key=config.llm_api_key,
-        base_url=config.llm_base_url if config.llm_base_url else None
+        base_url=config.llm_base_url if config.llm_base_url else None,
+        timeout=timeout,
+        max_retries=1,
     )
 
     prompt = f"""
@@ -880,9 +955,15 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
         await safe_answer(message, f"⏳ Procesando: <b>{video_info['file_name']}</b>...", config=config)
 
     caption_text = message.caption or ""
-    combined_text = f"{video_info['file_name']} {caption_text}"
     quality = detected_quality(video_info, caption_text)
     await state.update_data(**video_info, quality=quality)
+
+    local_data = local_parse_from_sources(video_info["file_name"], caption_text)
+    if local_data:
+        if quality:
+            local_data["quality"] = quality
+        if await handle_detected_media(user_id, message, state, bot, config, video_info, local_data):
+            return
 
     # 1. Intentar con LLM primero si está configurado
     if config.llm_api_key and config.llm_model:
@@ -890,7 +971,7 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
         
         if llm_data:
             current_data = await state.get_data()
-            llm_data = normalize_llm_data(llm_data, quality, combined_text)
+            llm_data = normalize_llm_data(llm_data, quality, video_info["file_name"], caption_text)
                 
             merged_data = {**current_data, **llm_data}
             await state.update_data(**merged_data)
@@ -929,45 +1010,6 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 return
             except KeyError as e:
                 logging.error(f"LLM data missing key for build_caption: {e}")
-
-    local_data = local_parse_series(combined_text)
-    if local_data:
-        if quality:
-            local_data["quality"] = quality
-        await state.update_data(**local_data)
-        if local_data.get("quality"):
-            merged_data = {**(await state.get_data()), **local_data}
-            missing = required_fields_missing(merged_data)
-            if missing:
-                logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
-                if merged_data.get("media_type") == "series" and missing == ["quality"]:
-                    await state.set_state(MediaForm.series_quality)
-                    await ask_series_quality(message, state)
-                    return
-                if merged_data.get("media_type") == "movie" and missing == ["quality"]:
-                    await state.set_state(MediaForm.movie_quality)
-                    await ask_movie_quality(message, state)
-                    return
-
-            try:
-                caption = build_caption(merged_data)
-                await state.update_data(caption=caption)
-                if config.llm_auto_post:
-                    try:
-                        await safe_send_media(bot, config.target_channel_id, video_info, caption, config=config)
-                        await state.clear()
-                        await after_file_processed(user_id, state, bot, config)
-                        return
-                    except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
-                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
-                await state.set_state(MediaForm.confirming_llm)
-                await safe_answer(message, f"Detección local:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?", reply_markup=llm_confirm_keyboard())
-                return
-            except KeyError as e:
-                logging.error(f"Local data missing key for build_caption: {e}")
-        await state.set_state(MediaForm.series_quality)
-        await ask_series_quality(message, state)
-        return
 
     # 2. Intentar con TMDB si LLM no está o falló
     if config.tmdb_api_key:
