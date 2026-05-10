@@ -438,6 +438,24 @@ async def start(message: Message, state: FSMContext, config: Config) -> None:
     )
 
 
+def detected_quality_keyboard(quality: str | None, prefix: str) -> InlineKeyboardMarkup | None:
+    if not quality:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=f"Usar {quality}", callback_data=f"{prefix}:detected_quality")]
+        ]
+    )
+
+
+def optional_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Sin extras", callback_data=f"{prefix}:none")]
+        ]
+    )
+
+
 async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, config: Config) -> None:
     queue = user_queues.get(user_id, [])
     if not queue:
@@ -612,7 +630,7 @@ async def handle_tmdb_confirm(callback: CallbackQuery, state: FSMContext, config
 
     if media_type == "movie":
         await state.set_state(MediaForm.movie_quality)
-        await safe_answer(callback.message, f"Película: {title} ({date[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
+        await ask_movie_quality(callback.message, state, f"Película: {title} ({date[:4]})\n\n")
     else:
         await state.set_state(MediaForm.series_season)
         await safe_answer(callback.message, f"Serie: {title}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
@@ -642,22 +660,37 @@ async def movie_name(message: Message, state: FSMContext) -> None:
     await safe_answer(message, "Año de estreno. Ejemplo: 2023")
 
 
+async def ask_movie_quality(message: Message, state: FSMContext, prefix: str = "") -> None:
+    data = await state.get_data()
+    detected = data.get("quality")
+    text = f"{prefix}Calidad o resolución. Ejemplo: 1080p"
+    if detected:
+        text += f"\nDetectada: {detected}. Puedes tocar el botón o escribir otra."
+    await safe_answer(message, text, reply_markup=detected_quality_keyboard(detected, "movie_quality"))
+
+
+async def ask_movie_optional(message: Message) -> None:
+    await safe_answer(
+        message,
+        "Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay extras, toca el botón.",
+        reply_markup=optional_keyboard("movie_optional"),
+    )
+
+
 async def movie_year(message: Message, state: FSMContext) -> None:
     year = clean_text(message.text or "")
     if not re.fullmatch(r"\d{4}", year):
         await safe_answer(message, "El año debe tener 4 números. Ejemplo: 2023")
         return
     await state.update_data(year=year)
-    data = await state.get_data()
     await state.set_state(MediaForm.movie_quality)
-    detected = data.get("quality")
-    await safe_answer(message, f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+    await ask_movie_quality(message, state)
 
 
 async def movie_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.movie_optional)
-    await safe_answer(message, "Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay, escribe -")
+    await ask_movie_optional(message)
 
 
 async def movie_optional(message: Message, state: FSMContext) -> None:
@@ -669,6 +702,23 @@ async def series_name(message: Message, state: FSMContext) -> None:
     await state.update_data(name=clean_text(message.text or ""))
     await state.set_state(MediaForm.series_season)
     await safe_answer(message, "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
+
+
+async def ask_series_quality(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    detected = data.get("quality")
+    text = "Calidad o resolución. Ejemplo: 1080p"
+    if detected:
+        text += f"\nDetectada: {detected}. Puedes tocar el botón o escribir otra."
+    await safe_answer(message, text, reply_markup=detected_quality_keyboard(detected, "series_quality"))
+
+
+async def ask_series_optional(message: Message) -> None:
+    await safe_answer(
+        message,
+        "Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay extras, toca el botón.",
+        reply_markup=optional_keyboard("series_optional"),
+    )
 
 
 async def series_season(message: Message, state: FSMContext) -> None:
@@ -687,21 +737,55 @@ async def series_episode(message: Message, state: FSMContext) -> None:
         await safe_answer(message, "Formato inválido. Usa E seguido de mínimo 2 números. Ejemplo: E04")
         return
     await state.update_data(episode=episode)
-    data = await state.get_data()
     await state.set_state(MediaForm.series_quality)
-    detected = data.get("quality")
-    await safe_answer(message, f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+    await ask_series_quality(message, state)
 
 
 async def series_quality(message: Message, state: FSMContext) -> None:
     await state.update_data(quality=normalize_quality(message.text or ""))
     await state.set_state(MediaForm.series_optional)
-    await safe_answer(message, "Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay, escribe -")
+    await ask_series_optional(message)
 
 
 async def series_optional(message: Message, state: FSMContext) -> None:
     await state.update_data(optional=clean_optional(message.text or ""))
     await show_preview(message, state)
+
+
+async def handle_movie_quality_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    quality = data.get("quality")
+    if not quality:
+        await callback.answer("No hay calidad detectada", show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(quality=quality)
+    await state.set_state(MediaForm.movie_optional)
+    await ask_movie_optional(callback.message)
+
+
+async def handle_series_quality_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    quality = data.get("quality")
+    if not quality:
+        await callback.answer("No hay calidad detectada", show_alert=True)
+        return
+    await callback.answer()
+    await state.update_data(quality=quality)
+    await state.set_state(MediaForm.series_optional)
+    await ask_series_optional(callback.message)
+
+
+async def handle_movie_optional_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.update_data(optional="")
+    await show_preview(callback.message, state)
+
+
+async def handle_series_optional_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.update_data(optional="")
+    await show_preview(callback.message, state)
 
 
 async def show_preview(message: Message, state: FSMContext) -> None:
@@ -770,6 +854,18 @@ async def main() -> None:
     async def confirm_handler(callback: CallbackQuery, state: FSMContext) -> None:
         await confirm(callback, state, bot, config)
 
+    async def movie_quality_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_movie_quality_callback(callback, state)
+
+    async def series_quality_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_series_quality_callback(callback, state)
+
+    async def movie_optional_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_movie_optional_callback(callback, state)
+
+    async def series_optional_callback_handler(callback: CallbackQuery, state: FSMContext) -> None:
+        await handle_series_optional_callback(callback, state)
+
     private_chat = F.chat.type == "private"
 
     dp.message.register(start_handler, CommandStart(), private_chat)
@@ -778,6 +874,10 @@ async def main() -> None:
     dp.callback_query.register(llm_confirm_handler, F.data.startswith("llm:"), MediaForm.confirming_llm)
     dp.callback_query.register(tmdb_confirm_handler, F.data.startswith("tmdb:"), MediaForm.confirming_tmdb)
     dp.callback_query.register(choose_type_handler, F.data.startswith("type:"), MediaForm.choosing_type)
+    dp.callback_query.register(movie_quality_callback_handler, F.data == "movie_quality:detected_quality", MediaForm.movie_quality)
+    dp.callback_query.register(series_quality_callback_handler, F.data == "series_quality:detected_quality", MediaForm.series_quality)
+    dp.callback_query.register(movie_optional_callback_handler, F.data == "movie_optional:none", MediaForm.movie_optional)
+    dp.callback_query.register(series_optional_callback_handler, F.data == "series_optional:none", MediaForm.series_optional)
     dp.message.register(movie_name, MediaForm.movie_name, private_chat)
     dp.message.register(movie_year, MediaForm.movie_year, private_chat)
     dp.message.register(movie_quality, MediaForm.movie_quality, private_chat)
