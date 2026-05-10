@@ -1,0 +1,686 @@
+import asyncio
+import json
+import logging
+import os
+import re
+import urllib.parse
+from dataclasses import dataclass
+from typing import Literal
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from openai import AsyncOpenAI
+
+# Diccionario global para manejar las colas por usuario
+user_queues: dict[int, list[Message]] = {}
+user_processing: dict[int, bool] = {}
+
+
+MediaType = Literal["movie", "series"]
+
+VIDEO_EXTENSIONS = {".mkv", ".mp4"}
+MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", re.IGNORECASE)
+SEASON_RE = re.compile(r"^S\d{2,}$", re.IGNORECASE)
+EPISODE_RE = re.compile(r"^E\d{2,}$", re.IGNORECASE)
+QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNORECASE)
+
+
+class MediaForm(StatesGroup):
+    confirming_llm = State()
+    confirming_omdb = State()
+    choosing_type = State()
+    movie_name = State()
+    movie_year = State()
+    movie_quality = State()
+    movie_optional = State()
+    series_name = State()
+    series_season = State()
+    series_episode = State()
+    series_quality = State()
+    series_optional = State()
+    confirming = State()
+
+
+@dataclass(frozen=True)
+class Config:
+    bot_token: str
+    target_channel_id: int | str
+    allowed_user_ids: set[int]
+    omdb_api_key: str
+    llm_api_key: str
+    llm_base_url: str
+    llm_model: str
+    llm_auto_post: bool
+
+
+def load_config() -> Config:
+    token = os.getenv("BOT_TOKEN", "").strip()
+    channel = os.getenv("TARGET_CHANNEL_ID", "").strip()
+    omdb_key = os.getenv("OMDB_API_KEY", "").strip()
+    llm_key = os.getenv("LLM_API_KEY", "").strip()
+    llm_url = os.getenv("LLM_BASE_URL", "").strip()
+    llm_model = os.getenv("LLM_MODEL", "").strip()
+    llm_auto_post = os.getenv("LLM_AUTO_POST", "false").strip().lower() == "true"
+
+    if not token:
+        raise RuntimeError("Falta BOT_TOKEN en las variables de entorno.")
+    if not channel:
+        raise RuntimeError("Falta TARGET_CHANNEL_ID en las variables de entorno.")
+
+    allowed_raw = os.getenv("ALLOWED_USER_IDS", "").strip()
+    allowed = {int(item.strip()) for item in allowed_raw.split(",") if item.strip()} if allowed_raw else set()
+
+    try:
+        target_channel_id: int | str = int(channel)
+    except ValueError:
+        target_channel_id = channel
+
+    return Config(
+        bot_token=token, 
+        target_channel_id=target_channel_id, 
+        allowed_user_ids=allowed, 
+        omdb_api_key=omdb_key,
+        llm_api_key=llm_key,
+        llm_base_url=llm_url,
+        llm_model=llm_model,
+        llm_auto_post=llm_auto_post
+    )
+
+
+def llm_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Enviar al canal", callback_data="llm:send"),
+                InlineKeyboardButton(text="Editar manual", callback_data="llm:edit"),
+            ]
+        ]
+    )
+
+
+def omdb_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Sí, es correcto", callback_data="omdb:yes"),
+                InlineKeyboardButton(text="No, continuar manual", callback_data="omdb:no"),
+            ]
+        ]
+    )
+
+
+def type_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="Película", callback_data="type:movie")
+    builder.button(text="Serie", callback_data="type:series")
+    builder.adjust(2)
+    return builder.as_markup()
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Enviar al canal", callback_data="confirm:send"),
+                InlineKeyboardButton(text="Cancelar", callback_data="confirm:cancel"),
+            ]
+        ]
+    )
+
+
+def get_video_info(message: Message) -> dict | None:
+    if message.video:
+        return {
+            "kind": "video",
+            "file_id": message.video.file_id,
+            "file_name": message.video.file_name or "video.mp4",
+            "width": message.video.width,
+            "height": message.video.height,
+        }
+
+    if message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
+        return {
+            "kind": "document",
+            "file_id": message.document.file_id,
+            "file_name": message.document.file_name or "video.mkv",
+            "width": None,
+            "height": None,
+        }
+
+    if message.document and get_extension(message.document.file_name or "") in VIDEO_EXTENSIONS:
+        return {
+            "kind": "document",
+            "file_id": message.document.file_id,
+            "file_name": message.document.file_name or "video.mkv",
+            "width": None,
+            "height": None,
+        }
+
+    return None
+
+
+def get_extension(file_name: str) -> str:
+    _, ext = os.path.splitext(file_name.lower())
+    return ext
+
+
+def clean_filename_for_search(file_name: str) -> str:
+    name, _ = os.path.splitext(file_name)
+    # Remove quality, codecs, years, episodes etc to get just the title
+    name = re.sub(r"(19|20)\d{2}.*", "", name) # Remove year and everything after
+    name = re.sub(r"S\d{2}E\d{2}.*", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p).*", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[\._-]", " ", name)
+    return name.strip()
+
+
+async def search_omdb(query: str, api_key: str) -> dict | None:
+    if not api_key or not query:
+        return None
+    url = f"http://www.omdbapi.com/?t={urllib.parse.quote(query)}&apikey={api_key}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    if data.get("Response") == "True":
+                        return data
+    except Exception as e:
+        logging.error(f"Error searching OMDB: {e}")
+    return None
+
+
+async def parse_filename_with_llm(filename: str, caption: str, config: Config) -> dict | None:
+    if not config.llm_api_key or not config.llm_model:
+        return None
+
+    client = AsyncOpenAI(
+        api_key=config.llm_api_key,
+        base_url=config.llm_base_url if config.llm_base_url else None
+    )
+
+    prompt = f"""
+Analiza el siguiente nombre de archivo de video y/o su texto adjunto y extrae los metadatos de la película o serie.
+Debes detectar si es una película o una serie, incluso si está mal etiquetado (ej: "t1 s3" significa temporada 1, episodio 3).
+
+Archivo: {filename}
+Texto adjunto (si hay): {caption}
+
+Devuelve ÚNICAMENTE un JSON válido con la siguiente estructura (omite los campos que no puedas detectar, pero respeta los nombres de las claves):
+
+Para películas:
+{{
+  "media_type": "movie",
+  "name": "Título limpio",
+  "year": "Año (4 dígitos)",
+  "quality": "Resolución (ej: 1080p, 720p)",
+  "optional": "Opcionales (ej: WEBRip x265 Dual Audio)"
+}}
+
+Para series:
+{{
+  "media_type": "series",
+  "name": "Título limpio",
+  "season": "Temporada en formato S00 (ej: S01)",
+  "episode": "Episodio en formato E00 (ej: E03)",
+  "quality": "Resolución (ej: 1080p)",
+  "optional": "Opcionales (ej: WEB-DL DDP5.1)"
+}}
+
+Solo devuelve el JSON, sin texto adicional ni markdown.
+"""
+    try:
+        response = await client.chat.completions.create(
+            model=config.llm_model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=300
+        )
+        content = response.choices[0].message.content or ""
+        content = content.strip("` \n")
+        if content.startswith("json"):
+            content = content[4:].strip()
+            
+        data = json.loads(content)
+        if data.get("media_type") in ("movie", "series"):
+            return data
+    except Exception as e:
+        logging.error(f"Error parseando con LLM: {e}")
+    return None
+
+
+def is_multipart(file_name: str) -> bool:
+    name_without_ext, _ = os.path.splitext(file_name)
+    return bool(MULTIPART_RE.search(name_without_ext))
+
+
+def detected_quality(video_info: dict) -> str | None:
+    file_name = video_info.get("file_name") or ""
+    if match := QUALITY_RE.search(file_name):
+        return match.group(1).lower()
+
+    height = video_info.get("height")
+    if not height:
+        return None
+
+    if height >= 2000:
+        return "2160p"
+    if height >= 1300:
+        return "1440p"
+    if height >= 900:
+        return "1080p"
+    if height >= 650:
+        return "720p"
+    if height >= 450:
+        return "480p"
+    return f"{height}p"
+
+
+def clean_text(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def clean_optional(value: str) -> str:
+    value = clean_text(value)
+    if value in {"-", ".", "no", "No", "NO", "ninguno", "Ninguno"}:
+        return ""
+    return value.strip(" .")
+
+
+def normalize_quality(value: str) -> str:
+    match = QUALITY_RE.search(value)
+    return match.group(1).lower() if match else clean_text(value)
+
+
+def ensure_extension(file_name: str) -> str:
+    ext = get_extension(file_name)
+    return ext if ext in VIDEO_EXTENSIONS else ".mkv"
+
+
+def build_caption(data: dict) -> str:
+    ext = ensure_extension(data["file_name"])
+    optional = data.get("optional", "")
+
+    if data["media_type"] == "movie":
+        parts = [data["name"], data["year"], data["quality"]]
+        if optional:
+            parts.append(optional)
+        return f"{' '.join(parts)}{ext}"
+
+    parts = [f"{data['name']}.{data['season']}{data['episode']}"]
+    if optional:
+        parts.append(optional.replace(" ", "."))
+    parts.append(data["quality"])
+    return f"{'.'.join(parts)}{ext}"
+
+
+def is_allowed(config: Config, user_id: int | None) -> bool:
+    return bool(user_id) and (not config.allowed_user_ids or user_id in config.allowed_user_ids)
+
+
+async def reject_if_not_allowed(message: Message, config: Config) -> bool:
+    if is_allowed(config, message.from_user.id if message.from_user else None):
+        return False
+    await message.answer("No tienes permiso para usar este bot.")
+    return True
+
+
+async def start(message: Message, state: FSMContext, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    await state.clear()
+    await message.answer(
+        "Envíame o reenvíame un video como archivo/documento o video. "
+        "Puedes enviarme varios a la vez y los procesaré uno por uno en cola.\n"
+        "No guardo archivos en disco; Telegram lo copia directo al canal."
+    )
+
+
+async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, config: Config) -> None:
+    queue = user_queues.get(user_id, [])
+    if not queue:
+        user_processing[user_id] = False
+        await bot.send_message(user_id, "✅ Todos los videos en cola han sido procesados.")
+        return
+
+    user_processing[user_id] = True
+    message = queue.pop(0)
+    
+    # Rest of the receive_video logic goes here, but we pass the message
+    await state.clear()
+    
+    video_info = get_video_info(message)
+    if not video_info:
+        await message.answer("Archivo omitido: no es un video válido .mkv o .mp4.")
+        await process_next_in_queue(user_id, state, bot, config)
+        return
+
+    if is_multipart(video_info["file_name"]):
+        await message.answer(f"Archivo <b>{video_info['file_name']}</b> multipart detectado y omitido automáticamente.")
+        await process_next_in_queue(user_id, state, bot, config)
+        return
+
+    ext = get_extension(video_info["file_name"])
+    if ext and ext not in VIDEO_EXTENSIONS:
+        await message.answer(f"Archivo <b>{video_info['file_name']}</b> omitido: La extensión debe ser .mkv o .mp4.")
+        await process_next_in_queue(user_id, state, bot, config)
+        return
+
+    await message.answer(f"⏳ Procesando: <b>{video_info['file_name']}</b>...")
+
+    quality = detected_quality(video_info)
+    await state.update_data(**video_info, quality=quality)
+
+    # 1. Intentar con LLM primero si está configurado
+    if config.llm_api_key and config.llm_model:
+        caption_text = message.caption or ""
+        llm_data = await parse_filename_with_llm(video_info["file_name"], caption_text, config)
+        
+        if llm_data:
+            current_data = await state.get_data()
+            if not llm_data.get("quality") and quality:
+                llm_data["quality"] = quality
+                
+            merged_data = {**current_data, **llm_data}
+            await state.update_data(**merged_data)
+            
+            try:
+                caption = build_caption(merged_data)
+                await state.update_data(caption=caption)
+                
+                if config.llm_auto_post:
+                    try:
+                        if video_info["kind"] == "video":
+                            await bot.send_video(config.target_channel_id, video_info["file_id"], caption=caption)
+                        else:
+                            await bot.send_document(config.target_channel_id, video_info["file_id"], caption=caption)
+                        
+                        await message.answer(f"✅ Auto-publicado: <code>{caption}</code>")
+                        await state.clear()
+                        await process_next_in_queue(user_id, state, bot, config)
+                        return
+                    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+                        await message.answer(f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
+                        # Si falla el auto-post, cae al flujo manual normal
+                
+                await state.set_state(MediaForm.confirming_llm)
+                
+                text = f"🤖 <b>Detección inteligente (LLM)</b>\n\nHe generado el siguiente formato:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?"
+                await message.answer(text, reply_markup=llm_confirm_keyboard())
+                return
+            except KeyError as e:
+                logging.error(f"LLM data missing key for build_caption: {e}")
+
+    # 2. Intentar con OMDB si LLM no está o falló
+    if config.omdb_api_key:
+        search_query = clean_filename_for_search(video_info["file_name"])
+        if search_query:
+            omdb_data = await search_omdb(search_query, config.omdb_api_key)
+            if omdb_data:
+                await state.set_state(MediaForm.confirming_omdb)
+                await state.update_data(omdb_data=omdb_data)
+                
+                title = omdb_data.get("Title", "Desconocido")
+                year = omdb_data.get("Year", "Desconocido")
+                kind = omdb_data.get("Type", "Desconocido")
+                
+                text = f"Encontré esto en IMDb:\n\n<b>{title}</b> ({year}) - {kind.capitalize()}\n\n¿Es correcto?"
+                await message.answer(text, reply_markup=omdb_confirm_keyboard())
+                return
+
+    await state.set_state(MediaForm.choosing_type)
+    quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
+    await message.answer(f"¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+
+
+async def receive_video(message: Message, state: FSMContext, bot: Bot, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+
+    user_id = message.from_user.id
+    if user_id not in user_queues:
+        user_queues[user_id] = []
+        
+    user_queues[user_id].append(message)
+    
+    queue_length = len(user_queues[user_id])
+    if queue_length > 1:
+        await message.answer(f"📥 Video añadido a la cola (Posición: {queue_length}).")
+        
+    if not user_processing.get(user_id, False):
+        await process_next_in_queue(user_id, state, bot, config)
+
+
+async def handle_llm_confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: Config) -> None:
+    if not is_allowed(config, callback.from_user.id if callback.from_user else None):
+        await callback.answer("No autorizado", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+    
+    if action == "send":
+        await callback.answer()
+        data = await state.get_data()
+        try:
+            if data["kind"] == "video":
+                await bot.send_video(config.target_channel_id, data["file_id"], caption=data["caption"])
+            else:
+                await bot.send_document(config.target_channel_id, data["file_id"], caption=data["caption"])
+            
+            await state.clear()
+            await callback.message.answer("✅ Archivo enviado al canal correctamente.")
+        except (TelegramBadRequest, TelegramForbiddenError) as exc:
+            await callback.message.answer(f"Error enviando al canal: {exc}")
+            
+        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        return
+
+    # Si elige editar manual, vamos a la selección de tipo
+    await callback.answer()
+    data = await state.get_data()
+    quality = data.get("quality")
+    quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
+    
+    await state.set_state(MediaForm.choosing_type)
+    await callback.message.answer(f"Modo manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+
+
+async def handle_omdb_confirm(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not is_allowed(config, callback.from_user.id if callback.from_user else None):
+        await callback.answer("No autorizado", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+    await callback.answer()
+    
+    data = await state.get_data()
+    omdb_data = data.get("omdb_data", {})
+    quality = data.get("quality")
+    quality_text = f" Detecté calidad: {quality}." if quality else " No pude detectar la calidad."
+
+    if action == "no":
+        await state.set_state(MediaForm.choosing_type)
+        await callback.message.answer(f"Ok, continuemos manual. ¿Es película o serie?{quality_text}", reply_markup=type_keyboard())
+        return
+
+    # User confirmed OMDB data
+    media_type = "series" if omdb_data.get("Type") == "series" else "movie"
+    await state.update_data(
+        media_type=media_type,
+        name=omdb_data.get("Title", ""),
+        year=omdb_data.get("Year", "")[:4] # Sometimes year is "2023–"
+    )
+
+    if media_type == "movie":
+        await state.set_state(MediaForm.movie_quality)
+        await callback.message.answer(f"Película: {omdb_data.get('Title')} ({omdb_data.get('Year')[:4]})\n\nCalidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {quality}. Escríbela o confirma con esa misma." if quality else ""))
+    else:
+        await state.set_state(MediaForm.series_season)
+        await callback.message.answer(f"Serie: {omdb_data.get('Title')}\n\nTemporada con S y mínimo 2 dígitos. Ejemplo: S01")
+
+
+async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+    if not is_allowed(config, callback.from_user.id if callback.from_user else None):
+        await callback.answer("No autorizado", show_alert=True)
+        return
+
+    media_type = callback.data.split(":", 1)[1]
+    await callback.answer()
+    await state.update_data(media_type=media_type)
+
+    if media_type == "movie":
+        await state.set_state(MediaForm.movie_name)
+        await callback.message.answer("Título de la película. Ejemplo: Ghosted")
+        return
+
+    await state.set_state(MediaForm.series_name)
+    await callback.message.answer("Título de la serie. Ejemplo: Harikatha Sambhavami Yuge Yuge")
+
+
+async def movie_name(message: Message, state: FSMContext) -> None:
+    await state.update_data(name=clean_text(message.text or ""))
+    await state.set_state(MediaForm.movie_year)
+    await message.answer("Año de estreno. Ejemplo: 2023")
+
+
+async def movie_year(message: Message, state: FSMContext) -> None:
+    year = clean_text(message.text or "")
+    if not re.fullmatch(r"\d{4}", year):
+        await message.answer("El año debe tener 4 números. Ejemplo: 2023")
+        return
+    await state.update_data(year=year)
+    data = await state.get_data()
+    await state.set_state(MediaForm.movie_quality)
+    detected = data.get("quality")
+    await message.answer(f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+
+
+async def movie_quality(message: Message, state: FSMContext) -> None:
+    await state.update_data(quality=normalize_quality(message.text or ""))
+    await state.set_state(MediaForm.movie_optional)
+    await message.answer("Opcionales: codec, audio, fuente. Ejemplo: WEBRip x265 Dual Audio\nSi no hay, escribe -")
+
+
+async def movie_optional(message: Message, state: FSMContext) -> None:
+    await state.update_data(optional=clean_optional(message.text or ""))
+    await show_preview(message, state)
+
+
+async def series_name(message: Message, state: FSMContext) -> None:
+    await state.update_data(name=clean_text(message.text or ""))
+    await state.set_state(MediaForm.series_season)
+    await message.answer("Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
+
+
+async def series_season(message: Message, state: FSMContext) -> None:
+    season = clean_text(message.text or "").upper()
+    if not SEASON_RE.fullmatch(season):
+        await message.answer("Formato inválido. Usa S seguido de mínimo 2 números. Ejemplo: S01")
+        return
+    await state.update_data(season=season)
+    await state.set_state(MediaForm.series_episode)
+    await message.answer("Episodio con E y mínimo 2 dígitos. Ejemplo: E04")
+
+
+async def series_episode(message: Message, state: FSMContext) -> None:
+    episode = clean_text(message.text or "").upper()
+    if not EPISODE_RE.fullmatch(episode):
+        await message.answer("Formato inválido. Usa E seguido de mínimo 2 números. Ejemplo: E04")
+        return
+    await state.update_data(episode=episode)
+    data = await state.get_data()
+    await state.set_state(MediaForm.series_quality)
+    detected = data.get("quality")
+    await message.answer(f"Calidad o resolución. Ejemplo: 1080p" + (f"\nDetectada: {detected}. Escríbela o confirma con esa misma." if detected else ""))
+
+
+async def series_quality(message: Message, state: FSMContext) -> None:
+    await state.update_data(quality=normalize_quality(message.text or ""))
+    await state.set_state(MediaForm.series_optional)
+    await message.answer("Opcionales: título del episodio, codec, audio, fuente. Ejemplo: WEB-DL DDP5.1\nSi no hay, escribe -")
+
+
+async def series_optional(message: Message, state: FSMContext) -> None:
+    await state.update_data(optional=clean_optional(message.text or ""))
+    await show_preview(message, state)
+
+
+async def show_preview(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    caption = build_caption(data)
+    await state.update_data(caption=caption)
+    await state.set_state(MediaForm.confirming)
+    await message.answer(f"Vista previa:\n<code>{caption}</code>", reply_markup=confirm_keyboard())
+
+
+async def confirm(callback: CallbackQuery, state: FSMContext, bot: Bot, config: Config) -> None:
+    if not is_allowed(config, callback.from_user.id if callback.from_user else None):
+        await callback.answer("No autorizado", show_alert=True)
+        return
+
+    action = callback.data.split(":", 1)[1]
+    if action == "cancel":
+        await callback.answer("Cancelado")
+        await callback.message.answer("Operación cancelada para este archivo.")
+        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        return
+
+    data = await state.get_data()
+    try:
+        if data["kind"] == "video":
+            await bot.send_video(config.target_channel_id, data["file_id"], caption=data["caption"])
+        else:
+            await bot.send_document(config.target_channel_id, data["file_id"], caption=data["caption"])
+    except (TelegramBadRequest, TelegramForbiddenError) as exc:
+        await callback.answer("No se pudo enviar", show_alert=True)
+        await callback.message.answer(f"Error enviando al canal: {exc}")
+        await process_next_in_queue(callback.from_user.id, state, bot, config)
+        return
+
+    await callback.answer("Enviado")
+    await callback.message.answer("✅ Archivo enviado al canal.")
+    await process_next_in_queue(callback.from_user.id, state, bot, config)
+
+
+async def cancel(message: Message, state: FSMContext, bot: Bot, config: Config) -> None:
+    await message.answer("Operación cancelada para este archivo.")
+    await process_next_in_queue(message.from_user.id, state, bot, config)
+
+
+async def main() -> None:
+    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
+    config = load_config()
+    bot = Bot(config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.message.register(lambda message, state: start(message, state, config), CommandStart())
+    dp.message.register(lambda message, state: cancel(message, state, bot, config), F.text.casefold() == "/cancel")
+    dp.message.register(lambda message, state: receive_video(message, state, bot, config), F.video | F.document)
+    dp.callback_query.register(lambda callback, state: handle_llm_confirm(callback, state, bot, config), F.data.startswith("llm:"), MediaForm.confirming_llm)
+    dp.callback_query.register(lambda callback, state: handle_omdb_confirm(callback, state, config), F.data.startswith("omdb:"), MediaForm.confirming_omdb)
+    dp.callback_query.register(lambda callback, state: choose_type(callback, state, config), F.data.startswith("type:"), MediaForm.choosing_type)
+    dp.message.register(movie_name, MediaForm.movie_name)
+    dp.message.register(movie_year, MediaForm.movie_year)
+    dp.message.register(movie_quality, MediaForm.movie_quality)
+    dp.message.register(movie_optional, MediaForm.movie_optional)
+    dp.message.register(series_name, MediaForm.series_name)
+    dp.message.register(series_season, MediaForm.series_season)
+    dp.message.register(series_episode, MediaForm.series_episode)
+    dp.message.register(series_quality, MediaForm.series_quality)
+    dp.message.register(series_optional, MediaForm.series_optional)
+    dp.callback_query.register(lambda callback, state: confirm(callback, state, bot, config), F.data.startswith("confirm:"), MediaForm.confirming)
+
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
