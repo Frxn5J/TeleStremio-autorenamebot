@@ -67,6 +67,18 @@ MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", 
 SEASON_RE = re.compile(r"^S\d{2,}$", re.IGNORECASE)
 EPISODE_RE = re.compile(r"^E\d{2,}$", re.IGNORECASE)
 QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNORECASE)
+SEASON_EPISODE_TEXT_RE = re.compile(
+    r"(?P<title>.*?)"
+    r"(?:\b(?:temp|temporada|season|t)\.?\s*(?P<season>\d{1,2})\b)"
+    r"[\s._-]*"
+    r"(?:\b(?:ep|episodio|episode|e)\.?\s*(?P<episode>\d{1,3})\b)"
+    r"(?P<episode_title>.*)",
+    re.IGNORECASE,
+)
+SXX_EXX_RE = re.compile(
+    r"(?P<title>.*?)(?:S(?P<season>\d{1,2})\s*E(?P<episode>\d{1,3}))(?P<episode_title>.*)",
+    re.IGNORECASE,
+)
 
 
 class MediaForm(StatesGroup):
@@ -221,6 +233,112 @@ def clean_filename_for_search(file_name: str) -> str:
     return name.strip()
 
 
+def normalize_metadata_text(value: str) -> str:
+    value = os.path.splitext(value)[0]
+    value = re.sub(r"[._-]+", " ", value)
+    value = re.sub(r"\s+", " ", value)
+    return value.strip()
+
+
+def format_season(value: str | int | None) -> str | None:
+    if value is None:
+        return None
+    if match := re.search(r"\d+", str(value)):
+        return f"S{int(match.group(0)):02d}"
+    return None
+
+
+def format_episode(value: str | int | None) -> str | None:
+    if value is None:
+        return None
+    if match := re.search(r"\d+", str(value)):
+        return f"E{int(match.group(0)):02d}"
+    return None
+
+
+def clean_detected_name(value: str) -> str:
+    value = normalize_metadata_text(value)
+    value = QUALITY_RE.sub("", value)
+    value = re.sub(r"\b(19|20)\d{2}\b", "", value)
+    value = re.sub(r"\b(?:mp4|mkv|avi|web-dl|webrip|bluray|x264|x265|h264|h265)\b", "", value, flags=re.IGNORECASE)
+    return clean_text(value).strip(" .")
+
+
+def local_parse_series(text: str) -> dict | None:
+    normalized = normalize_metadata_text(text)
+    match = SEASON_EPISODE_TEXT_RE.search(normalized) or SXX_EXX_RE.search(normalized)
+    if not match:
+        lower = normalized.lower()
+        temp_match = re.search(r"\b(?:temp|temporada|season|t)\.?\s*(\d{1,2})\b", lower, re.IGNORECASE)
+        ep_match = re.search(r"\b(?:ep|episodio|episode|e)\.?\s*(\d{1,3})\b", lower, re.IGNORECASE)
+        if not temp_match or not ep_match:
+            return None
+        title = normalized[: temp_match.start()]
+        episode_title = normalized[ep_match.end() :]
+        name = clean_detected_name(title)
+        season = format_season(temp_match.group(1))
+        episode = format_episode(ep_match.group(1))
+        if not name or not season or not episode:
+            return None
+        return {
+            "media_type": "series",
+            "name": name,
+            "season": season,
+            "episode": episode,
+            "optional": clean_detected_name(episode_title),
+        }
+
+    if not match:
+        return None
+
+    name = clean_detected_name(match.group("title"))
+    season = format_season(match.group("season"))
+    episode = format_episode(match.group("episode"))
+    if not name or not season or not episode:
+        return None
+
+    episode_title = clean_detected_name(match.groupdict().get("episode_title") or "")
+    return {
+        "media_type": "series",
+        "name": name,
+        "season": season,
+        "episode": episode,
+        "optional": episode_title,
+    }
+
+
+def normalize_llm_data(data: dict, fallback_quality: str | None, combined_text: str) -> dict:
+    result = dict(data)
+    local_series = local_parse_series(combined_text)
+    if local_series and result.get("media_type") == "series":
+        for key in ("name", "season", "episode"):
+            if not result.get(key):
+                result[key] = local_series.get(key)
+        if not result.get("optional"):
+            result["optional"] = local_series.get("optional", "")
+
+    if result.get("media_type") == "series":
+        result["season"] = format_season(result.get("season")) or result.get("season")
+        result["episode"] = format_episode(result.get("episode")) or result.get("episode")
+
+    if not result.get("quality") and fallback_quality:
+        result["quality"] = fallback_quality
+    if result.get("quality") is None:
+        result["quality"] = ""
+    if result.get("optional") is None:
+        result["optional"] = ""
+
+    return result
+
+
+def required_fields_missing(data: dict) -> list[str]:
+    if data.get("media_type") == "movie":
+        return [key for key in ("name", "year", "quality") if not data.get(key)]
+    if data.get("media_type") == "series":
+        return [key for key in ("name", "season", "episode", "quality") if not data.get(key)]
+    return ["media_type"]
+
+
 def extract_llm_content(response: object) -> str:
     if isinstance(response, str):
         if "data:" in response and "chat.completion.chunk" in response:
@@ -314,7 +432,7 @@ async def search_tmdb(query: str, api_key: str) -> dict | None:
     return None
 
 
-async def parse_filename_with_llm(filename: str, caption: str, config: Config) -> dict | None:
+async def parse_filename_with_llm(filename: str, caption: str, local_quality: str | None, config: Config) -> dict | None:
     if not config.llm_api_key or not config.llm_model:
         return None
 
@@ -325,10 +443,20 @@ async def parse_filename_with_llm(filename: str, caption: str, config: Config) -
 
     prompt = f"""
 Analiza el siguiente nombre de archivo de video y/o su texto adjunto y extrae los metadatos de la película o serie.
-Debes detectar si es una película o una serie, incluso si está mal etiquetado (ej: "t1 s3" significa temporada 1, episodio 3).
+Debes detectar si es una película o una serie, incluso si está mal etiquetado.
+
+Reglas importantes:
+- "t1 s3", "T1 E3", "Temp. 1 Ep.1", "Temporada 1 Episodio 1" significan temporada 1 y episodio 1/3 según corresponda.
+- Siempre devuelve temporada como S con 2 dígitos: temporada 1 => "S01".
+- Siempre devuelve episodio como E con 2 dígitos: episodio 1 => "E01".
+- Si después del episodio aparece texto, normalmente es el título del episodio y debe ir en "optional". Ejemplo: "The Boys Temp. 1 Ep.1 Las reglas del juego" => optional "Las reglas del juego".
+- Si ves calidad/resolución como 1080p, 720p, 2160p, etc. ponla en "quality".
+- Si la calidad detectada localmente no es null, usa esa calidad salvo que el texto indique otra más clara.
+- Si no hay calidad visible, usa null en "quality" y no inventes resolución.
 
 Archivo: {filename}
 Texto adjunto (si hay): {caption}
+Calidad detectada localmente: {local_quality or "null"}
 
 Devuelve ÚNICAMENTE un JSON válido con la siguiente estructura (omite los campos que no puedas detectar, pero respeta los nombres de las claves):
 
@@ -348,7 +476,7 @@ Para series:
   "season": "Temporada en formato S00 (ej: S01)",
   "episode": "Episodio en formato E00 (ej: E03)",
   "quality": "Resolución (ej: 1080p)",
-  "optional": "Opcionales (ej: WEB-DL DDP5.1)"
+  "optional": "Título del episodio u opcionales (ej: Las reglas del juego, WEB-DL DDP5.1)"
 }}
 
 Solo devuelve el JSON, sin texto adicional ni markdown.
@@ -385,9 +513,9 @@ def is_multipart(file_name: str) -> bool:
     return bool(MULTIPART_RE.search(name_without_ext))
 
 
-def detected_quality(video_info: dict) -> str | None:
-    file_name = video_info.get("file_name") or ""
-    if match := QUALITY_RE.search(file_name):
+def detected_quality(video_info: dict, caption: str = "") -> str | None:
+    searchable = f"{video_info.get('file_name') or ''} {caption}"
+    if match := QUALITY_RE.search(searchable):
         return match.group(1).lower()
 
     height = video_info.get("height")
@@ -518,22 +646,34 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
 
     await safe_answer(message, f"⏳ Procesando: <b>{video_info['file_name']}</b>...")
 
-    quality = detected_quality(video_info)
+    caption_text = message.caption or ""
+    combined_text = f"{video_info['file_name']} {caption_text}"
+    quality = detected_quality(video_info, caption_text)
     await state.update_data(**video_info, quality=quality)
 
     # 1. Intentar con LLM primero si está configurado
     if config.llm_api_key and config.llm_model:
-        caption_text = message.caption or ""
-        llm_data = await parse_filename_with_llm(video_info["file_name"], caption_text, config)
+        llm_data = await parse_filename_with_llm(video_info["file_name"], caption_text, quality, config)
         
         if llm_data:
             current_data = await state.get_data()
-            if not llm_data.get("quality") and quality:
-                llm_data["quality"] = quality
+            llm_data = normalize_llm_data(llm_data, quality, combined_text)
                 
             merged_data = {**current_data, **llm_data}
             await state.update_data(**merged_data)
-            
+
+            missing = required_fields_missing(merged_data)
+            if missing:
+                logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
+                if merged_data.get("media_type") == "series" and missing == ["quality"]:
+                    await state.set_state(MediaForm.series_quality)
+                    await ask_series_quality(message, state)
+                    return
+                if merged_data.get("media_type") == "movie" and missing == ["quality"]:
+                    await state.set_state(MediaForm.movie_quality)
+                    await ask_movie_quality(message, state)
+                    return
+
             try:
                 caption = build_caption(merged_data)
                 await state.update_data(caption=caption)
@@ -557,6 +697,46 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
                 return
             except KeyError as e:
                 logging.error(f"LLM data missing key for build_caption: {e}")
+
+    local_data = local_parse_series(combined_text)
+    if local_data:
+        if quality:
+            local_data["quality"] = quality
+        await state.update_data(**local_data)
+        if local_data.get("quality"):
+            merged_data = {**(await state.get_data()), **local_data}
+            missing = required_fields_missing(merged_data)
+            if missing:
+                logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
+                if merged_data.get("media_type") == "series" and missing == ["quality"]:
+                    await state.set_state(MediaForm.series_quality)
+                    await ask_series_quality(message, state)
+                    return
+                if merged_data.get("media_type") == "movie" and missing == ["quality"]:
+                    await state.set_state(MediaForm.movie_quality)
+                    await ask_movie_quality(message, state)
+                    return
+
+            try:
+                caption = build_caption(merged_data)
+                await state.update_data(caption=caption)
+                if config.llm_auto_post:
+                    try:
+                        await safe_send_media(bot, config.target_channel_id, video_info, caption)
+                        await safe_answer(message, f"✅ Auto-publicado: <code>{caption}</code>")
+                        await state.clear()
+                        await process_next_in_queue(user_id, state, bot, config)
+                        return
+                    except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
+                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.")
+                await state.set_state(MediaForm.confirming_llm)
+                await safe_answer(message, f"Detección local:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?", reply_markup=llm_confirm_keyboard())
+                return
+            except KeyError as e:
+                logging.error(f"Local data missing key for build_caption: {e}")
+        await state.set_state(MediaForm.series_quality)
+        await ask_series_quality(message, state)
+        return
 
     # 2. Intentar con TMDB si LLM no está o falló
     if config.tmdb_api_key:
