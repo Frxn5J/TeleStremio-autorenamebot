@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 
 from aiogram.types import Message
 
@@ -36,6 +37,8 @@ SXX_EXX_RE = re.compile(
     r"(?P<title>.*?)(?:S(?P<season>\d{1,2})\s*E(?P<episode>\d{1,3}))(?P<episode_title>.*)",
     re.IGNORECASE,
 )
+VARIATION_SELECTOR_RE = re.compile(r"[\ufe00-\ufe0f\u20e3\U000e0100-\U000e01ef]")
+ZERO_WIDTH_RE = re.compile(r"[\u200b-\u200f\u2060\ufeff]")
 
 
 def get_video_info(message: Message) -> dict | None:
@@ -127,6 +130,21 @@ def strip_noise_text(value: str) -> str:
     value = SPAM_TOKEN_RE.sub(" ", value)
     value = re.sub(r"\b(?:0?[1-9]|[12]\d|3[01])\s+(?:0?[1-9]|1[0-2])\s+\d{2,4}\b", " ", value)
     return clean_text(value)
+
+
+def strip_decorative_symbols(value: str) -> str:
+    value = VARIATION_SELECTOR_RE.sub("", value or "")
+    value = ZERO_WIDTH_RE.sub("", value)
+    chars = []
+    for char in value:
+        category = unicodedata.category(char)
+        if category in {"So", "Sk"}:
+            chars.append(" ")
+            continue
+        if category == "Cf":
+            continue
+        chars.append(char)
+    return "".join(chars)
 
 
 def format_season(value: str | int | None) -> str | None:
@@ -335,6 +353,7 @@ def detected_quality(video_info: dict, caption: str = "") -> str | None:
 
 
 def clean_text(value: str) -> str:
+    value = strip_decorative_symbols(value)
     return re.sub(r"\s+", " ", value.strip())
 
 

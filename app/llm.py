@@ -7,6 +7,7 @@ import re
 from openai import AsyncOpenAI
 
 from app.config import Config, env_float
+from app.metadata import strip_noise_text
 
 
 def extract_llm_content(response: object) -> str:
@@ -82,6 +83,9 @@ def extract_json_object(text: str) -> dict:
 async def parse_filename_with_llm(filename: str, caption: str, local_quality: str | None, config: Config) -> dict | None:
     if not config.llm_api_key or not config.llm_model:
         return None
+
+    filename = strip_noise_text(filename)
+    caption = strip_noise_text(caption)
 
     timeout = env_float("LLM_TIMEOUT", 15.0)
     client = AsyncOpenAI(

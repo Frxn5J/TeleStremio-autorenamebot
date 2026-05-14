@@ -42,6 +42,7 @@ from app.metadata import (
     VIDEO_EXTENSIONS,
     build_caption,
     choose_search_query,
+    clean_detected_name,
     clean_optional,
     clean_text,
     current_file_label,
@@ -729,7 +730,7 @@ async def choose_type(callback: CallbackQuery, state: FSMContext, config: Config
 
 
 async def movie_name(message: Message, state: FSMContext) -> None:
-    await state.update_data(name=clean_text(message.text or ""))
+    await state.update_data(name=clean_detected_name(message.text or ""))
     await state.set_state(MediaForm.movie_year)
     data = await state.get_data()
     await safe_answer(message, current_file_label(data) + "Año de estreno. Ejemplo: 2023")
@@ -775,7 +776,7 @@ async def movie_optional(message: Message, state: FSMContext) -> None:
 
 
 async def series_name(message: Message, state: FSMContext) -> None:
-    await state.update_data(name=clean_text(message.text or ""))
+    await state.update_data(name=clean_detected_name(message.text or ""))
     await state.set_state(MediaForm.series_season)
     data = await state.get_data()
     await safe_answer(message, current_file_label(data) + "Temporada con S y mínimo 2 dígitos. Ejemplo: S01")
