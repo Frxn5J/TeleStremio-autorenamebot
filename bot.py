@@ -53,6 +53,7 @@ from app.metadata import (
     normalize_llm_data,
     normalize_quality,
     required_fields_missing,
+    tmdb_result_to_metadata,
     video_info_from_pending,
 )
 from app.states import MediaForm
@@ -525,23 +526,32 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     quality = detected_quality(video_info, caption_text)
     await state.update_data(**video_info, quality=quality)
 
-    local_data = local_parse_from_sources(video_info["file_name"], caption_text)
-    if local_data:
-        if quality:
-            local_data["quality"] = quality
-        if await handle_detected_media(user_id, message, state, bot, config, video_info, local_data):
-            return
+    search_query = choose_search_query(video_info["file_name"], caption_text)
+    tmdb_detected = None
 
-    # 1. Intentar con LLM primero si está configurado
-    has_useful_context = bool(choose_search_query(video_info["file_name"], caption_text))
+    # 1. Intentar con TMDB primero usando una query saneada.
+    if config.tmdb_api_key and search_query:
+        tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
+        if tmdb_data:
+            tmdb_detected = tmdb_result_to_metadata(tmdb_data, quality, video_info["file_name"], caption_text)
+            if tmdb_detected and not required_fields_missing(tmdb_detected):
+                if await handle_detected_media(user_id, message, state, bot, config, video_info, tmdb_detected):
+                    return
+
+    # 2. Intentar con LLM si TMDB no resolvió suficiente.
+    has_useful_context = bool(search_query)
     if config.llm_api_key and config.llm_model and has_useful_context:
         llm_data = await parse_filename_with_llm(video_info["file_name"], caption_text, quality, config)
         
         if llm_data:
             current_data = await state.get_data()
             llm_data = normalize_llm_data(llm_data, quality, video_info["file_name"], caption_text)
-                
-            merged_data = {**current_data, **llm_data}
+
+            merged_data = {**current_data, **(tmdb_detected or {}), **llm_data}
+            if tmdb_detected:
+                for key in ("media_type", "name", "year"):
+                    if tmdb_detected.get(key):
+                        merged_data[key] = tmdb_detected[key]
             merged_data = await enrich_missing_from_tmdb(merged_data, config)
             await state.update_data(**merged_data)
 
@@ -582,24 +592,18 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             except KeyError as e:
                 logging.error(f"LLM data missing key for build_caption: {e}")
 
-    # 2. Intentar con TMDB si LLM no está o falló
-    if config.tmdb_api_key:
-        search_query = choose_search_query(video_info["file_name"], caption_text)
-        if search_query:
-            tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
-            if tmdb_data:
-                await state.set_state(MediaForm.confirming_tmdb)
-                await state.update_data(tmdb_data=tmdb_data)
-                
-                media_type = tmdb_data.get("media_type", "Desconocido")
-                title = tmdb_data.get("title") or tmdb_data.get("name") or "Desconocido"
-                date = tmdb_data.get("release_date") or tmdb_data.get("first_air_date") or ""
-                year = date[:4] if date else "Desconocido"
-                kind = "Serie" if media_type == "tv" else "Película"
-                
-                text = f"Encontré esto en TMDB:\n\n<b>{title}</b> ({year}) - {kind}\n\n¿Es correcto?"
-                await safe_answer(message, text, reply_markup=tmdb_confirm_keyboard())
-                return
+    # 3. Si TMDB dio algo parcial y no hay LLM útil, continuar con ese dato antes del fallback local/manual.
+    if tmdb_detected:
+        if await handle_detected_media(user_id, message, state, bot, config, video_info, tmdb_detected):
+            return
+
+    # 4. Parsing local solo como fallback, evitando captions genéricos o spam.
+    local_data = local_parse_from_sources(video_info["file_name"], caption_text)
+    if local_data:
+        if quality:
+            local_data["quality"] = quality
+        if await handle_detected_media(user_id, message, state, bot, config, video_info, local_data):
+            return
 
     if config.llm_auto_post:
         pending_id = save_pending_review(config, user_id, video_info, caption_text, quality, "insufficient metadata")

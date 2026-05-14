@@ -103,6 +103,8 @@ Reglas importantes:
 - Si ves calidad/resolución como 1080p, 720p, 2160p, etc. ponla en "quality".
 - Si la calidad detectada localmente no es null, usa esa calidad salvo que el texto indique otra más clara.
 - Si no hay calidad visible, usa null en "quality" y no inventes resolución.
+- Ignora textos promocionales o genéricos como ver, online, latino, HD, nombres de sitios, links, arrobas, hashtags, IDs largos, fechas u horas sueltas.
+- No uses captions de spam ni textos genéricos como "video 2026" como título.
 
 Archivo: {filename}
 Texto adjunto (si hay): {caption}

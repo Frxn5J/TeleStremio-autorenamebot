@@ -11,6 +11,15 @@ MULTIPART_RE = re.compile(r"(?:^|[\s._-])(?:part\s*\d+|cd\s*\d+)(?:[\s._-]|$)", 
 SEASON_RE = re.compile(r"^S\d{2,}$", re.IGNORECASE)
 EPISODE_RE = re.compile(r"^E\d{2,}$", re.IGNORECASE)
 QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNORECASE)
+URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+SOCIAL_TOKEN_RE = re.compile(r"(?:^|\s)[@#][\w.-]+", re.IGNORECASE)
+LONG_ID_RE = re.compile(r"\b\d{7,}\b")
+LOOSE_TIME_RE = re.compile(r"\b\d{1,2}(?:[:.]\d{2}){1,2}\b")
+SPAM_TOKEN_RE = re.compile(
+    r"\b(?:ver|mira|mirar|online|latino|hd|pelisplus|pelis|plus|cuevana|repelis|gnula|descargar|download|gratis|free|full|"
+    r"completa|completo|castellano|subtitulado|sub|espanol|español|mega|telegram|canal|official|oficial)\b",
+    re.IGNORECASE,
+)
 GENERIC_TITLE_RE = re.compile(
     r"^(?:video|videos|vid|movie|movies|film|pelicula|película|archivo|file|document|documento|clip|media|telegram|download|upload|untitled|sin titulo|sin título)\s*\d*$",
     re.IGNORECASE,
@@ -67,12 +76,13 @@ def get_extension(file_name: str) -> str:
 
 def clean_filename_for_search(file_name: str) -> str:
     name, _ = os.path.splitext(file_name)
+    name = strip_noise_text(name)
     # Remove quality, codecs, years, episodes etc to get just the title
-    name = re.sub(r"(19|20)\d{2}.*", "", name) # Remove year and everything after
+    name = re.sub(r"\b(19|20)\d{2}\b.*", "", name) # Remove year and everything after
     name = re.sub(r"S\d{2}E\d{2}.*", "", name, flags=re.IGNORECASE)
     name = re.sub(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p).*", "", name, flags=re.IGNORECASE)
     name = re.sub(r"[\._-]", " ", name)
-    return name.strip()
+    return clean_text(name).strip(" .-_")
 
 
 def is_generic_title(value: str) -> bool:
@@ -103,9 +113,20 @@ def choose_search_query(file_name: str, caption: str) -> str | None:
 
 def normalize_metadata_text(value: str) -> str:
     value = os.path.splitext(value)[0]
+    value = strip_noise_text(value)
     value = re.sub(r"[._-]+", " ", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
+
+
+def strip_noise_text(value: str) -> str:
+    value = URL_RE.sub(" ", value or "")
+    value = SOCIAL_TOKEN_RE.sub(" ", value)
+    value = LONG_ID_RE.sub(" ", value)
+    value = LOOSE_TIME_RE.sub(" ", value)
+    value = SPAM_TOKEN_RE.sub(" ", value)
+    value = re.sub(r"\b(?:0?[1-9]|[12]\d|3[01])\s+(?:0?[1-9]|1[0-2])\s+\d{2,4}\b", " ", value)
+    return clean_text(value)
 
 
 def format_season(value: str | int | None) -> str | None:
@@ -139,7 +160,8 @@ def clean_detected_name(value: str) -> str:
     value = QUALITY_RE.sub("", value)
     value = re.sub(r"\b(19|20)\d{2}\b", "", value)
     value = re.sub(r"\b(?:mp4|mkv|avi|web-dl|webrip|bluray|x264|x265|h264|h265)\b", "", value, flags=re.IGNORECASE)
-    return clean_text(value).strip(" .")
+    value = clean_text(value).strip(" .")
+    return "" if is_generic_title(value) else value
 
 
 def local_parse_series(text: str) -> dict | None:
@@ -223,6 +245,32 @@ def local_parse_from_sources(file_name: str, caption: str) -> dict | None:
     return None
 
 
+def tmdb_result_to_metadata(tmdb_data: dict, quality: str | None, file_name: str, caption: str) -> dict | None:
+    title = clean_detected_name(tmdb_data.get("title") or tmdb_data.get("name") or "")
+    if not title:
+        return None
+
+    media_type = tmdb_data.get("media_type")
+    date = tmdb_data.get("release_date") or tmdb_data.get("first_air_date") or ""
+    result: dict = {
+        "media_type": "series" if media_type == "tv" else "movie",
+        "name": title,
+        "quality": quality or "",
+        "optional": "",
+    }
+    if result["media_type"] == "movie" and date:
+        result["year"] = date[:4]
+
+    local_data = local_parse_from_sources(file_name, caption)
+    if local_data and local_data.get("media_type") == result["media_type"]:
+        for key in ("season", "episode", "year"):
+            if local_data.get(key) and not result.get(key):
+                result[key] = local_data[key]
+        result["optional"] = clean_optional(local_data.get("optional", ""))
+
+    return result
+
+
 def normalize_llm_data(data: dict, fallback_quality: str | None, file_name: str, caption: str) -> dict:
     result = dict(data)
     local_data = local_parse_from_sources(file_name, caption)
@@ -244,14 +292,18 @@ def normalize_llm_data(data: dict, fallback_quality: str | None, file_name: str,
     if result.get("optional") is None:
         result["optional"] = ""
 
+    if result.get("name"):
+        result["name"] = clean_detected_name(str(result["name"]))
+    result["optional"] = clean_optional(str(result.get("optional") or ""))
+
     return result
 
 
 def required_fields_missing(data: dict) -> list[str]:
     if data.get("media_type") == "movie":
-        return [key for key in ("name", "year", "quality") if not data.get(key)]
+        return [key for key in ("name", "year", "quality") if not data.get(key) or (key == "name" and not clean_detected_name(str(data.get(key))))]
     if data.get("media_type") == "series":
-        return [key for key in ("name", "season", "episode", "quality") if not data.get(key)]
+        return [key for key in ("name", "season", "episode", "quality") if not data.get(key) or (key == "name" and not clean_detected_name(str(data.get(key))))]
     return ["media_type"]
 
 
@@ -287,10 +339,13 @@ def clean_text(value: str) -> str:
 
 
 def clean_optional(value: str) -> str:
-    value = clean_text(value)
+    value = clean_text(strip_noise_text(value))
     if value in {"-", ".", "no", "No", "NO", "ninguno", "Ninguno"}:
         return ""
-    return value.strip(" .")
+    value = QUALITY_RE.sub("", value)
+    value = re.sub(r"\b(?:mp4|mkv|avi)\b|\.(?:mp4|mkv|avi)$", "", value, flags=re.IGNORECASE)
+    value = clean_text(value).strip(" .")
+    return "" if is_generic_title(value) else value
 
 
 def normalize_quality(value: str) -> str:
@@ -305,15 +360,16 @@ def ensure_extension(file_name: str) -> str:
 
 def build_caption(data: dict) -> str:
     ext = ensure_extension(data["file_name"])
-    optional = data.get("optional", "")
+    optional = clean_optional(str(data.get("optional", "")))
+    name = clean_detected_name(str(data.get("name", "")))
 
     if data["media_type"] == "movie":
-        parts = [data["name"], data["year"], data["quality"]]
+        parts = [name, data["year"], data["quality"]]
         if optional:
             parts.append(optional)
         return f"{' '.join(parts)}{ext}"
 
-    parts = [f"{data['name']}.{data['season']}{data['episode']}"]
+    parts = [f"{name}.{data['season']}{data['episode']}"]
     if optional:
         parts.append(optional.replace(" ", "."))
     parts.append(data["quality"])
