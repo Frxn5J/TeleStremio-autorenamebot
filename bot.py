@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -47,10 +50,12 @@ from app.metadata import (
     clean_text,
     current_file_label,
     detected_quality,
+    ffprobe_tags_to_text,
     get_extension,
     get_video_info,
     is_multipart,
     local_parse_from_sources,
+    local_parse_from_ffprobe,
     normalize_llm_data,
     normalize_quality,
     required_fields_missing,
@@ -65,6 +70,7 @@ user_queues: dict[int, list[Message]] = {}
 user_processing: dict[int, bool] = {}
 user_processed_counts: dict[int, int] = {}
 telegram_send_lock = asyncio.Lock()
+deep_scan_lock = asyncio.Lock()
 last_telegram_send_at = 0.0
 
 
@@ -75,6 +81,115 @@ async def publish_media(bot: Bot, config: "Config", data: dict, caption: str) ->
         return False
     await safe_send_media(bot, config.target_channel_id, data, caption, config=config)
     register_published(config, data, caption)
+    return True
+
+
+async def save_unresolved_review(message: Message, user_id: int, config: Config, video_info: dict, quality: str | None, reason: str) -> None:
+    pending_id = save_pending_review(config, user_id, video_info, message.caption or "", quality, reason)
+    logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
+    await safe_answer(message, f"⚠️ No pude detectar metadata suficiente. Guardado como pendiente #{pending_id}. Usa /review para revisarlo.", config=config)
+
+
+async def run_ffprobe(file_path: str, timeout: float) -> dict | None:
+    executable = shutil.which("ffprobe")
+    if not executable:
+        return None
+
+    process = await asyncio.create_subprocess_exec(
+        executable,
+        "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        "-show_streams",
+        file_path,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.communicate()
+        logging.warning("ffprobe timed out for %s", file_path)
+        return None
+
+    if process.returncode != 0 or not stdout:
+        return None
+    try:
+        return json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        logging.warning("Could not parse ffprobe output: %s", exc)
+        return None
+
+
+async def download_and_probe(bot: Bot, config: Config, video_info: dict) -> dict | None:
+    file_size = video_info.get("file_size") or 0
+    max_bytes = max(1, config.deep_scan_max_mb) * 1024 * 1024
+    if file_size and file_size > max_bytes:
+        logging.info("Skipping deep scan for %s: size %s exceeds %s", video_info.get("file_name"), file_size, max_bytes)
+        return None
+
+    temp_dir = tempfile.mkdtemp(prefix="telestremio-deep-")
+    temp_path = os.path.join(temp_dir, "input" + (get_extension(video_info.get("file_name") or "") or ".mkv"))
+    try:
+        telegram_file = await bot.get_file(video_info["file_id"])
+        if not telegram_file.file_path:
+            return None
+        await bot.download_file(telegram_file.file_path, destination=temp_path)
+        return await run_ffprobe(temp_path, config.deep_scan_timeout)
+    except Exception as exc:
+        logging.warning("Deep scan download/probe failed for %s: %s", video_info.get("file_name"), exc)
+        return None
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+async def handle_deep_scan_fallback(user_id: int, message: Message, state: FSMContext, bot: Bot, config: Config, video_info: dict, quality: str | None) -> bool:
+    if not config.deep_scan_enabled:
+        return False
+
+    async with deep_scan_lock:
+        await safe_answer(message, f"🔎 Detección normal falló. Analizando temporalmente: <b>{video_info['file_name']}</b>...", config=config)
+        probe = await download_and_probe(bot, config, video_info)
+
+    probe_text = ffprobe_tags_to_text(probe)
+    caption_text = message.caption or ""
+    combined_name = clean_text(" ".join(part for part in [video_info["file_name"], probe_text] if part))
+    scan_quality = quality or detected_quality({**video_info, "file_name": combined_name}, caption_text)
+
+    async def try_detected(detected_data: dict | None) -> bool:
+        if not detected_data:
+            return False
+        enriched = await enrich_missing_from_tmdb(detected_data, config)
+        if required_fields_missing(enriched):
+            return False
+        return await handle_detected_media(user_id, message, state, bot, config, video_info, enriched)
+
+    search_query = choose_search_query(combined_name, caption_text)
+    if config.tmdb_api_key and search_query:
+        tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
+        if tmdb_data:
+            tmdb_detected = tmdb_result_to_metadata(tmdb_data, scan_quality, combined_name, caption_text)
+            if await try_detected(tmdb_detected):
+                return True
+
+    if config.llm_api_key and config.llm_model and (search_query or probe_text):
+        llm_data = await parse_filename_with_llm(combined_name, caption_text, scan_quality, config)
+        if llm_data:
+            normalized = normalize_llm_data(llm_data, scan_quality, combined_name, caption_text)
+            if await try_detected(normalized):
+                return True
+
+    local_data = local_parse_from_ffprobe(probe, scan_quality) or local_parse_from_sources(combined_name, caption_text)
+    if local_data:
+        if scan_quality and not local_data.get("quality"):
+            local_data["quality"] = scan_quality
+        if await try_detected(local_data):
+            return True
+
+    await save_unresolved_review(message, user_id, config, video_info, scan_quality, "deep scan insufficient metadata")
+    await state.clear()
+    await after_file_processed(user_id, state, bot, config)
     return True
 
 
@@ -311,6 +426,7 @@ async def help_command(message: Message, config: Config) -> None:
         "/debug on|off - Activar/desactivar logs del LLM\n"
         "/setchannel -1001234567890 o @canal - Cambiar canal destino hasta reiniciar\n"
         "/speed safe|normal|fast - Cambiar velocidad de cola\n"
+        "/deepscan [status|on|off|timeout <segundos>|maxmb <MB>] - Configurar deep scan\n"
         "/queue - Ver videos pendientes en cola\n"
         "/pending - Ver cuántos archivos requieren revisión\n"
         "/review - Revisar el siguiente archivo pendiente\n"
@@ -338,6 +454,7 @@ async def config_command(message: Message, config: Config) -> None:
         f"Pausa por archivo: {config.telegram_file_interval}s\n"
         f"Reintentos Telegram: {config.telegram_max_retries}\n"
         f"Aviso de cola cada: {config.queue_notify_every}\n"
+        f"Deep scan: {'on' if config.deep_scan_enabled else 'off'} (timeout {config.deep_scan_timeout}s, max {config.deep_scan_max_mb} MB)\n"
         f"SQLite: <code>{config.database_path}</code>\n"
         f"Usuarios permitidos: {'todos' if not config.allowed_user_ids else len(config.allowed_user_ids)}\n"
         f"Procesando ahora: {processing}\n"
@@ -418,6 +535,57 @@ async def speed_command(message: Message, config: Config) -> None:
     save_setting(config, "telegram_file_interval", config.telegram_file_interval)
     save_setting(config, "queue_notify_every", config.queue_notify_every)
     await safe_answer(message, f"Velocidad cambiada a {args}: min={config.telegram_min_interval}s, archivo={config.telegram_file_interval}s, aviso cada {config.queue_notify_every}.")
+
+
+async def deepscan_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    args = command_args(message).split()
+    if not args or args[0].lower() == "status":
+        await safe_answer(
+            message,
+            "Deep scan actual:\n"
+            f"Estado: {'on' if config.deep_scan_enabled else 'off'}\n"
+            f"Timeout: {config.deep_scan_timeout}s\n"
+            f"Máximo: {config.deep_scan_max_mb} MB",
+        )
+        return
+
+    action = args[0].lower()
+    if action in {"on", "off"} and len(args) == 1:
+        value = action == "on"
+        config.deep_scan_enabled = value
+        save_setting(config, "deep_scan_enabled", "true" if value else "false")
+        await safe_answer(message, f"Deep scan cambiado a {'on' if value else 'off'}.")
+        return
+
+    if action == "timeout" and len(args) == 2:
+        try:
+            value = float(args[1])
+        except ValueError:
+            value = 0
+        if not 0 < value <= 300:
+            await safe_answer(message, "Timeout inválido. Usa un valor entre 1 y 300 segundos.")
+            return
+        config.deep_scan_timeout = value
+        save_setting(config, "deep_scan_timeout", value)
+        await safe_answer(message, f"Timeout de deep scan cambiado a {value}s.")
+        return
+
+    if action == "maxmb" and len(args) == 2:
+        try:
+            value = int(args[1])
+        except ValueError:
+            value = 0
+        if not 0 < value <= 51200:
+            await safe_answer(message, "Máximo inválido. Usa un valor entre 1 y 51200 MB.")
+            return
+        config.deep_scan_max_mb = value
+        save_setting(config, "deep_scan_max_mb", value)
+        await safe_answer(message, f"Máximo de deep scan cambiado a {value} MB.")
+        return
+
+    await safe_answer(message, "Uso: /deepscan [status|on|off|timeout <segundos>|maxmb <MB>]")
 
 
 async def queue_command(message: Message, config: Config) -> None:
@@ -559,43 +727,36 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
             missing = required_fields_missing(merged_data)
             if missing:
                 logging.info("LLM detected partial metadata, missing fields: %s", ", ".join(missing))
-                if config.llm_auto_post:
-                    pending_id = save_pending_review(config, user_id, video_info, caption_text, merged_data.get("quality"), f"missing: {', '.join(missing)}")
-                    logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
-                    await state.clear()
-                    await after_file_processed(user_id, state, bot, config)
+            else:
+                try:
+                    caption = build_caption(merged_data)
+                    await state.update_data(caption=caption)
+                    
+                    if config.llm_auto_post:
+                        try:
+                            published = await publish_media(bot, config, merged_data, caption)
+                            if not published:
+                                await safe_answer(message, f"⏭️ Duplicado omitido: <code>{caption}</code>", config=config)
+                            
+                            await state.clear()
+                            await after_file_processed(user_id, state, bot, config)
+                            return
+                        except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
+                            await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
+                            # Si falla el auto-post, cae al flujo manual normal
+                    
+                    await state.set_state(MediaForm.confirming_llm)
+                    
+                    text = f"🤖 <b>Detección inteligente (LLM)</b>\n\nHe generado el siguiente formato:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?"
+                    await safe_answer(message, text, reply_markup=llm_confirm_keyboard())
                     return
-                if await ask_missing_required_fields(message, state, bot, config, merged_data, missing):
-                    return
-
-            try:
-                caption = build_caption(merged_data)
-                await state.update_data(caption=caption)
-                
-                if config.llm_auto_post:
-                    try:
-                        published = await publish_media(bot, config, merged_data, caption)
-                        if not published:
-                            await safe_answer(message, f"⏭️ Duplicado omitido: <code>{caption}</code>", config=config)
-                        
-                        await state.clear()
-                        await after_file_processed(user_id, state, bot, config)
-                        return
-                    except (TelegramBadRequest, TelegramForbiddenError, TimeoutError) as exc:
-                        await safe_answer(message, f"❌ Error enviando auto-post al canal: {exc}\nPasando a modo manual.", config=config)
-                        # Si falla el auto-post, cae al flujo manual normal
-                
-                await state.set_state(MediaForm.confirming_llm)
-                
-                text = f"🤖 <b>Detección inteligente (LLM)</b>\n\nHe generado el siguiente formato:\n<code>{caption}</code>\n\n¿Deseas enviarlo directamente o editarlo manualmente?"
-                await safe_answer(message, text, reply_markup=llm_confirm_keyboard())
-                return
-            except KeyError as e:
-                logging.error(f"LLM data missing key for build_caption: {e}")
+                except KeyError as e:
+                    logging.error(f"LLM data missing key for build_caption: {e}")
 
     # 3. Si TMDB dio algo parcial y no hay LLM útil, continuar con ese dato antes del fallback local/manual.
     if tmdb_detected:
-        if await handle_detected_media(user_id, message, state, bot, config, video_info, tmdb_detected):
+        tmdb_detected = await enrich_missing_from_tmdb(tmdb_detected, config)
+        if not required_fields_missing(tmdb_detected) and await handle_detected_media(user_id, message, state, bot, config, video_info, tmdb_detected):
             return
 
     # 4. Parsing local solo como fallback, evitando captions genéricos o spam.
@@ -603,12 +764,15 @@ async def process_next_in_queue(user_id: int, state: FSMContext, bot: Bot, confi
     if local_data:
         if quality:
             local_data["quality"] = quality
-        if await handle_detected_media(user_id, message, state, bot, config, video_info, local_data):
+        local_data = await enrich_missing_from_tmdb(local_data, config)
+        if not required_fields_missing(local_data) and await handle_detected_media(user_id, message, state, bot, config, video_info, local_data):
             return
 
+    if await handle_deep_scan_fallback(user_id, message, state, bot, config, video_info, quality):
+        return
+
     if config.llm_auto_post:
-        pending_id = save_pending_review(config, user_id, video_info, caption_text, quality, "insufficient metadata")
-        logging.info("Saved pending review #%s for %s", pending_id, video_info.get("file_name"))
+        await save_unresolved_review(message, user_id, config, video_info, quality, "insufficient metadata")
         await state.clear()
         await after_file_processed(user_id, state, bot, config)
         return
@@ -939,6 +1103,9 @@ async def main() -> None:
     async def speed_handler(message: Message) -> None:
         await speed_command(message, config)
 
+    async def deepscan_handler(message: Message) -> None:
+        await deepscan_command(message, config)
+
     async def queue_handler(message: Message) -> None:
         await queue_command(message, config)
 
@@ -993,6 +1160,7 @@ async def main() -> None:
     dp.message.register(debug_handler, Command("debug"), private_chat)
     dp.message.register(setchannel_handler, Command("setchannel"), private_chat)
     dp.message.register(speed_handler, Command("speed"), private_chat)
+    dp.message.register(deepscan_handler, Command("deepscan"), private_chat)
     dp.message.register(queue_handler, Command("queue"), private_chat)
     dp.message.register(pending_handler, Command("pending"), private_chat)
     dp.message.register(review_handler, Command("review"), private_chat)

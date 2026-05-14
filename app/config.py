@@ -33,6 +33,9 @@ class Config:
     telegram_file_interval: float
     telegram_max_retries: int
     queue_notify_every: int
+    deep_scan_enabled: bool
+    deep_scan_timeout: float
+    deep_scan_max_mb: int
     database_path: str
 
 
@@ -49,6 +52,9 @@ def load_config() -> Config:
     telegram_file_interval = env_float("TELEGRAM_FILE_INTERVAL", 2.0)
     telegram_max_retries = env_int("TELEGRAM_MAX_RETRIES", 8)
     queue_notify_every = env_int("QUEUE_NOTIFY_EVERY", 25)
+    deep_scan_enabled = os.getenv("DEEP_SCAN_ENABLED", "true").strip().lower() == "true"
+    deep_scan_timeout = env_float("DEEP_SCAN_TIMEOUT", 20.0)
+    deep_scan_max_mb = env_int("DEEP_SCAN_MAX_MB", 2048)
     database_path = os.getenv("DATABASE_PATH", "/app/data/bot.sqlite3").strip()
 
     if not token:
@@ -78,6 +84,9 @@ def load_config() -> Config:
         telegram_file_interval=telegram_file_interval,
         telegram_max_retries=telegram_max_retries,
         queue_notify_every=queue_notify_every,
+        deep_scan_enabled=deep_scan_enabled,
+        deep_scan_timeout=deep_scan_timeout,
+        deep_scan_max_mb=deep_scan_max_mb,
         database_path=database_path,
     )
 

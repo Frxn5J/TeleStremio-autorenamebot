@@ -49,6 +49,7 @@ def get_video_info(message: Message) -> dict | None:
             "file_name": message.video.file_name or "video.mp4",
             "width": message.video.width,
             "height": message.video.height,
+            "file_size": message.video.file_size,
         }
 
     if message.document and message.document.mime_type and message.document.mime_type.startswith("video/"):
@@ -58,6 +59,7 @@ def get_video_info(message: Message) -> dict | None:
             "file_name": message.document.file_name or "video.mkv",
             "width": None,
             "height": None,
+            "file_size": message.document.file_size,
         }
 
     if message.document and get_extension(message.document.file_name or "") in VIDEO_EXTENSIONS:
@@ -67,6 +69,7 @@ def get_video_info(message: Message) -> dict | None:
             "file_name": message.document.file_name or "video.mkv",
             "width": None,
             "height": None,
+            "file_size": message.document.file_size,
         }
 
     return None
@@ -163,6 +166,76 @@ def video_info_from_pending(row: dict) -> dict:
         "width": row.get("width"),
         "height": row.get("height"),
     }
+
+
+def ffprobe_tags_to_text(probe: dict | None) -> str:
+    if not probe:
+        return ""
+
+    tags: dict[str, str] = {}
+    for source in [probe.get("format", {})] + list(probe.get("streams", [])):
+        for key, value in (source.get("tags") or {}).items():
+            if value is not None:
+                tags[key.lower()] = clean_text(str(value))
+
+    parts = []
+    for key in ("title", "show", "series", "season_number", "season", "episode_id", "episode_sort", "episode", "date", "year"):
+        value = tags.get(key)
+        if value:
+            parts.append(value[:4] if key == "date" and re.match(r"\d{4}", value) else value)
+
+    for stream in probe.get("streams", []):
+        if stream.get("codec_type") != "video":
+            continue
+        if stream.get("height"):
+            parts.append(f"{stream['height']}p")
+        break
+
+    return clean_text(" ".join(parts))
+
+
+def local_parse_from_ffprobe(probe: dict | None, fallback_quality: str | None = None) -> dict | None:
+    if not probe:
+        return None
+
+    tags: dict[str, str] = {}
+    for source in [probe.get("format", {})] + list(probe.get("streams", [])):
+        for key, value in (source.get("tags") or {}).items():
+            if value is not None:
+                tags[key.lower()] = clean_text(str(value))
+
+    quality = fallback_quality
+    if not quality:
+        for stream in probe.get("streams", []):
+            if stream.get("codec_type") == "video" and stream.get("height"):
+                quality = detected_quality({"height": stream.get("height"), "file_name": ""})
+                break
+
+    show = tags.get("show") or tags.get("series")
+    season = format_season(tags.get("season_number") or tags.get("season"))
+    episode = format_episode(tags.get("episode_id") or tags.get("episode_sort") or tags.get("episode"))
+    if show and season and episode:
+        return {
+            "media_type": "series",
+            "name": clean_detected_name(show),
+            "season": season,
+            "episode": episode,
+            "quality": quality or "",
+            "optional": clean_optional(tags.get("title") or ""),
+        }
+
+    title = tags.get("title")
+    year = tags.get("year") or tags.get("date", "")[:4]
+    if title and re.fullmatch(r"(?:19|20)\d{2}", year or ""):
+        return {
+            "media_type": "movie",
+            "name": clean_detected_name(title),
+            "year": year,
+            "quality": quality or "",
+            "optional": "",
+        }
+
+    return None
 
 
 def format_episode(value: str | int | None) -> str | None:

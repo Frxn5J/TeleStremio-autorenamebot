@@ -106,6 +106,14 @@ def apply_persisted_settings(config: Config) -> None:
         config.telegram_file_interval = float(settings["telegram_file_interval"])
     if "queue_notify_every" in settings:
         config.queue_notify_every = int(settings["queue_notify_every"])
+    if "deep_scan_enabled" in settings:
+        parsed = parse_bool_arg(settings["deep_scan_enabled"])
+        if parsed is not None:
+            config.deep_scan_enabled = parsed
+    if "deep_scan_timeout" in settings:
+        config.deep_scan_timeout = float(settings["deep_scan_timeout"])
+    if "deep_scan_max_mb" in settings:
+        config.deep_scan_max_mb = int(settings["deep_scan_max_mb"])
 
 
 def dedupe_key(caption: str) -> str:

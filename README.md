@@ -29,6 +29,9 @@ TELEGRAM_MIN_INTERVAL=1.2
 TELEGRAM_FILE_INTERVAL=2.0
 TELEGRAM_MAX_RETRIES=8
 QUEUE_NOTIFY_EVERY=25
+DEEP_SCAN_ENABLED=true
+DEEP_SCAN_TIMEOUT=20
+DEEP_SCAN_MAX_MB=2048
 DATABASE_PATH=/app/data/bot.sqlite3
 ```
 
@@ -55,6 +58,12 @@ DATABASE_PATH=/app/data/bot.sqlite3
 `TELEGRAM_MAX_RETRIES`: reintentos máximos si Telegram responde con timeout o flood control.
 
 `QUEUE_NOTIFY_EVERY`: cada cuántos archivos pendientes avisa el bot en cargas masivas.
+
+`DEEP_SCAN_ENABLED`: opcional (`true` o `false`). Si está activo y la detección normal falla, el bot descarga el archivo a un temporal, intenta leer metadata con `ffprobe` si está instalado, borra siempre el temporal y reintenta TMDB, LLM y parsing local antes de enviarlo a revisión pendiente.
+
+`DEEP_SCAN_TIMEOUT`: segundos máximos para esperar `ffprobe` en la detección secundaria.
+
+`DEEP_SCAN_MAX_MB`: tamaño máximo del archivo para deep scan. Si el archivo supera este límite, no se descarga y pasa al flujo de revisión pendiente.
 
 `DATABASE_PATH`: ruta del archivo SQLite persistente. En Coolify monta un volumen en `/app/data` para conservar la base entre redeploys. La base guarda publicaciones para evitar duplicados y también los cambios hechos con comandos como `/autopost`, `/debug`, `/setchannel` y `/speed`.
 
@@ -123,4 +132,4 @@ Harikatha Sambhavami Yuge Yuge.S01E04.WEB-DL.DDP5.1.1080p.mkv
 ## Notas
 
 - Telegram no permite cambiar realmente el nombre interno del archivo al reenviar/copy usando `file_id`; el bot coloca el nombre final como caption del mismo mensaje en el canal.
-- Para no llenar disco, este bot no descarga archivos. Si quieres renombrar el archivo físicamente antes de publicarlo, habría que descargarlo temporalmente, pero no es recomendable para servidores pequeños.
+- El flujo normal no descarga archivos. Solo si `DEEP_SCAN_ENABLED=true` y la detección normal falla, descarga un temporal para inspección secundaria y lo elimina siempre al terminar.
