@@ -62,6 +62,12 @@ def init_database(config: Config) -> None:
         )
 
 
+def reset_database(config: Config) -> None:
+    if os.path.exists(config.database_path):
+        os.remove(config.database_path)
+    init_database(config)
+
+
 def save_setting(config: Config, key: str, value: object) -> None:
     with sqlite3.connect(config.database_path) as conn:
         conn.execute(

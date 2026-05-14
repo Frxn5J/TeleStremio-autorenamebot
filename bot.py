@@ -23,6 +23,7 @@ from app.database import (
     mark_pending_review_done,
     pending_review_count,
     register_published,
+    reset_database,
     save_pending_review,
     save_setting,
 )
@@ -312,6 +313,7 @@ async def help_command(message: Message, config: Config) -> None:
         "/pending - Ver cuántos archivos requieren revisión\n"
         "/review - Revisar el siguiente archivo pendiente\n"
         "/clearqueue - Vaciar cola pendiente\n"
+        "/resetdb confirm - Borrar y recrear la base de datos\n"
         "/cancel - Cancelar archivo actual y pasar al siguiente",
     )
 
@@ -439,6 +441,16 @@ async def clearqueue_command(message: Message, config: Config) -> None:
     removed = len(user_queues.get(user_id, []))
     user_queues[user_id] = []
     await safe_answer(message, f"Cola vaciada. Videos removidos: {removed}.")
+
+
+async def resetdb_command(message: Message, config: Config) -> None:
+    if await reject_if_not_allowed(message, config):
+        return
+    if command_args(message).lower() != "confirm":
+        await safe_answer(message, "Esto borrará la base de datos SQLite. Para confirmar usa: /resetdb confirm")
+        return
+    reset_database(config)
+    await safe_answer(message, "Base de datos borrada y tablas recreadas correctamente.")
 
 
 async def pending_command(message: Message, config: Config) -> None:
@@ -928,6 +940,9 @@ async def main() -> None:
     async def clearqueue_handler(message: Message) -> None:
         await clearqueue_command(message, config)
 
+    async def resetdb_handler(message: Message) -> None:
+        await resetdb_command(message, config)
+
     async def pending_handler(message: Message) -> None:
         await pending_command(message, config)
 
@@ -977,6 +992,7 @@ async def main() -> None:
     dp.message.register(pending_handler, Command("pending"), private_chat)
     dp.message.register(review_handler, Command("review"), private_chat)
     dp.message.register(clearqueue_handler, Command("clearqueue"), private_chat)
+    dp.message.register(resetdb_handler, Command("resetdb"), private_chat)
     dp.message.register(cancel_handler, F.text.casefold() == "/cancel", private_chat)
     dp.message.register(receive_video_handler, (F.video | F.document), private_chat)
     dp.callback_query.register(llm_confirm_handler, F.data.startswith("llm:"), MediaForm.confirming_llm)
