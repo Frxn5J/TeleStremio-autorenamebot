@@ -13,7 +13,8 @@ SEASON_RE = re.compile(r"^S\d{2,}$", re.IGNORECASE)
 EPISODE_RE = re.compile(r"^E\d{2,}$", re.IGNORECASE)
 QUALITY_RE = re.compile(r"(2160p|1440p|1080p|720p|576p|540p|480p|360p)", re.IGNORECASE)
 URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
-SOCIAL_TOKEN_RE = re.compile(r"(?:^|\s)[@#][\w.-]+", re.IGNORECASE)
+LEADING_HANDLE_PREFIX_RE = re.compile(r"^@[A-Za-z0-9]{5,32}[._-]+(?=\S)")
+SOCIAL_TOKEN_RE = re.compile(r"(?:^|\s)[@#][\w.-]{2,32}(?=\s|$)", re.IGNORECASE)
 LONG_ID_RE = re.compile(r"\b\d{7,}\b")
 LOOSE_TIME_RE = re.compile(r"\b\d{1,2}(?:[:.]\d{2}){1,2}\b")
 SPAM_TOKEN_RE = re.compile(
@@ -127,6 +128,7 @@ def normalize_metadata_text(value: str) -> str:
 
 def strip_noise_text(value: str) -> str:
     value = URL_RE.sub(" ", value or "")
+    value = LEADING_HANDLE_PREFIX_RE.sub("", value)
     value = SOCIAL_TOKEN_RE.sub(" ", value)
     value = LONG_ID_RE.sub(" ", value)
     value = LOOSE_TIME_RE.sub(" ", value)

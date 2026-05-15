@@ -59,6 +59,7 @@ from app.metadata import (
     normalize_llm_data,
     normalize_quality,
     required_fields_missing,
+    strip_noise_text,
     tmdb_result_to_metadata,
     video_info_from_pending,
 )
@@ -72,6 +73,7 @@ user_processed_counts: dict[int, int] = {}
 telegram_send_lock = asyncio.Lock()
 deep_scan_lock = asyncio.Lock()
 last_telegram_send_at = 0.0
+DEEP_SCAN_FILE_TOO_BIG = "__telegram_file_too_big__"
 
 
 
@@ -138,6 +140,9 @@ async def download_and_probe(bot: Bot, config: Config, video_info: dict) -> dict
         await bot.download_file(telegram_file.file_path, destination=temp_path)
         return await run_ffprobe(temp_path, config.deep_scan_timeout)
     except Exception as exc:
+        if "file is too big" in str(exc).lower():
+            logging.info("Deep scan skipped for %s: Telegram file is too big", video_info.get("file_name"))
+            return {DEEP_SCAN_FILE_TOO_BIG: True}
         logging.warning("Deep scan download/probe failed for %s: %s", video_info.get("file_name"), exc)
         return None
     finally:
@@ -148,14 +153,7 @@ async def handle_deep_scan_fallback(user_id: int, message: Message, state: FSMCo
     if not config.deep_scan_enabled:
         return False
 
-    async with deep_scan_lock:
-        await safe_answer(message, f"🔎 Detección normal falló. Analizando temporalmente: <b>{video_info['file_name']}</b>...", config=config)
-        probe = await download_and_probe(bot, config, video_info)
-
-    probe_text = ffprobe_tags_to_text(probe)
     caption_text = message.caption or ""
-    combined_name = clean_text(" ".join(part for part in [video_info["file_name"], probe_text] if part))
-    scan_quality = quality or detected_quality({**video_info, "file_name": combined_name}, caption_text)
 
     async def try_detected(detected_data: dict | None) -> bool:
         if not detected_data:
@@ -164,6 +162,55 @@ async def handle_deep_scan_fallback(user_id: int, message: Message, state: FSMCo
         if required_fields_missing(enriched):
             return False
         return await handle_detected_media(user_id, message, state, bot, config, video_info, enriched)
+
+    text_quality = quality or detected_quality(video_info, caption_text)
+    search_query = choose_search_query(video_info["file_name"], caption_text)
+    if config.tmdb_api_key and search_query:
+        tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
+        if tmdb_data:
+            tmdb_detected = tmdb_result_to_metadata(tmdb_data, text_quality, video_info["file_name"], caption_text)
+            if await try_detected(tmdb_detected):
+                return True
+
+    local_data = local_parse_from_sources(video_info["file_name"], caption_text)
+    if local_data:
+        if text_quality and not local_data.get("quality"):
+            local_data["quality"] = text_quality
+        if await try_detected(local_data):
+            return True
+
+    sanitized_file_name = strip_noise_text(video_info["file_name"])
+    sanitized_caption = strip_noise_text(caption_text)
+    if sanitized_file_name != video_info["file_name"] or sanitized_caption != caption_text:
+        search_query = choose_search_query(sanitized_file_name, sanitized_caption)
+        if config.tmdb_api_key and search_query:
+            tmdb_data = await search_tmdb(search_query, config.tmdb_api_key)
+            if tmdb_data:
+                tmdb_detected = tmdb_result_to_metadata(tmdb_data, text_quality, sanitized_file_name, sanitized_caption)
+                if await try_detected(tmdb_detected):
+                    return True
+
+        local_data = local_parse_from_sources(sanitized_file_name, sanitized_caption)
+        if local_data:
+            if text_quality and not local_data.get("quality"):
+                local_data["quality"] = text_quality
+            if await try_detected(local_data):
+                return True
+
+    async with deep_scan_lock:
+        await safe_answer(message, f"🔎 Detección normal falló. Analizando temporalmente: <b>{video_info['file_name']}</b>...", config=config)
+        probe = await download_and_probe(bot, config, video_info)
+
+    probe_text = ffprobe_tags_to_text(probe)
+    combined_name = clean_text(" ".join(part for part in [video_info["file_name"], probe_text] if part))
+    scan_quality = quality or detected_quality({**video_info, "file_name": combined_name}, caption_text)
+
+    if probe and probe.get(DEEP_SCAN_FILE_TOO_BIG):
+        await save_unresolved_review(message, user_id, config, video_info, scan_quality, "deep scan file too big")
+        await safe_answer(message, "⚠️ Telegram no permite descargar este archivo para deep scan porque es demasiado grande. Lo dejé pendiente para revisión manual.", config=config)
+        await state.clear()
+        await after_file_processed(user_id, state, bot, config)
+        return True
 
     search_query = choose_search_query(combined_name, caption_text)
     if config.tmdb_api_key and search_query:
